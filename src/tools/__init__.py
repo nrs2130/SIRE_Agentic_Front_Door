@@ -7,6 +7,14 @@ from .comms_page import (
     send_page,
 )
 from .comms_page import build_server as build_comms_server
+from .labs_hl7 import (
+    LabOrderResult,
+    LabResult,
+    LabsAdapter,
+    create_labs_adapter,
+    order_labs,
+)
+from .labs_hl7 import build_server as build_labs_server
 from .oncall_lookup import (
     OnCallAdapter,
     OnCallLookupResult,
@@ -30,4 +38,11 @@ __all__ = [
     "build_comms_server",
     "create_comms_adapter",
     "send_page",
+    # labs_hl7
+    "LabsAdapter",
+    "LabOrderResult",
+    "LabResult",
+    "build_labs_server",
+    "create_labs_adapter",
+    "order_labs",
 ]

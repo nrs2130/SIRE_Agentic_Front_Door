@@ -27,6 +27,14 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // Copy the block above and rename for the next tool (labs_hl7, patient_context, …).
+    // labs_hl7: places lab orders + reads results over the Vocera HL7 Adapter.
+    ,"labs-hl7": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "labs_hl7"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+    // Copy the block above and rename for the next tool (patient_context, bed_telemetry, …).
   }
 }
