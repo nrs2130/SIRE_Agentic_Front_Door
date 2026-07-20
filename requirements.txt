@@ -1,13 +1,50 @@
-# Core
-azure-ai-voicelive>=1.0.0b1
+# ============================================================================
+#  Nightingale — voice-agentic platform dependencies
+#  Microsoft SDK versions verified against PyPI on 2026-07-20 (see comments).
+#  Pin exact versions for reproducibility; these APIs move fast.
+# ============================================================================
+
+# --- Core Azure (SIRE_demo baseline — keep working) -------------------------
 azure-core>=1.30.0
 azure-identity>=1.17.0
 
-# Audio
+# --- L1 Voice Gateway: Azure Voice Live (speech ⇄ intent) -------------------
+# azure-ai-voicelive 1.2.0 — GA, async-only. https://pypi.org/project/azure-ai-voicelive/
+azure-ai-voicelive[aiohttp]==1.2.0
+
+# --- L2 Orchestrator: Microsoft Agent Framework (workflow graph) ------------
+# agent-framework 1.11.0 (umbrella; includes agent-framework-foundry).
+# https://pypi.org/project/agent-framework/  — requires Python 3.10+
+agent-framework==1.11.0
+
+# --- L3 Agents / L4b Knowledge: Foundry project & hosted agents + Foundry IQ -
+# azure-ai-projects 2.3.0 — hosted agents & sessions are GA in this release.
+# https://pypi.org/project/azure-ai-projects/
+azure-ai-projects==2.3.0
+
+# --- L4 Tools: Model Context Protocol SDK -----------------------------------
+# mcp 1.28.1 (v1.x stable line; <2 pin per SDK guidance).
+# https://pypi.org/project/mcp/
+mcp[cli]==1.28.1,<2
+
+# --- L5 Telemetry: OpenTelemetry + Azure Monitor (Control Plane) ------------
+# opentelemetry-sdk/api 1.44.0. https://pypi.org/project/opentelemetry-sdk/
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+# azure-monitor-opentelemetry 1.8.9 — exports traces to the Foundry Control Plane.
+# https://pypi.org/project/azure-monitor-opentelemetry/
+azure-monitor-opentelemetry==1.8.9
+
+# --- Audio (SIRE_demo voice I/O) --------------------------------------------
 pyaudio>=0.2.14
 
-# HTTP client for AI Search REST calls
+# --- HTTP client for AI Search REST calls (SIRE RRF) ------------------------
 httpx>=0.27.0
 
-# Environment
+# --- Environment -------------------------------------------------------------
 python-dotenv>=1.0.0
+
+# --- Testing -----------------------------------------------------------------
+# pytest-asyncio 1.4.0. https://pypi.org/project/pytest-asyncio/
+pytest>=8.2,<9
+pytest-asyncio==1.4.0

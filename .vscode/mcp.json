@@ -1,5 +1,8 @@
 {
+  // MCP servers Copilot Agent mode can call while building Nightingale.
   "servers": {
+    // SIRE multi-strategy Azure AI Search (existing mcp_server/) — the entity
+    // resolution agent behind the voice front door.
     "sire-search": {
       "type": "stdio",
       "command": "python",
@@ -7,5 +10,16 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
+    // --- Placeholder for additional local MCP tool servers (added by /mcp-tool) ---
+    // Each new Vocera Engage adapter (mock or real) is registered here so Copilot
+    // and the orchestrator can invoke it. Copy the block below and rename:
+    //
+    // ,"oncall-lookup": {
+    //   "type": "stdio",
+    //   "command": "python",
+    //   "args": ["-m", "src.tools.oncall_lookup"],
+    //   "cwd": "${workspaceFolder}",
+    //   "env": {}
+    // }
   }
 }

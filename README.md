@@ -1,351 +1,279 @@
-# SIRE Voice Agent
+# Nightingale — Voice-Agentic "Front Door" for Stryker Smart Care
 
-Real-time voice assistant that uses the **Azure VoiceLive SDK** for speech I/O and **Azure AI Search** for entity resolution. A user speaks naturally, and the agent identifies their intent, searches for the matching person or hospital group, and confirms the result — all by voice.
-
-## Architecture
-
-```
-                          ┌──────────────────────────────────┐
-  Microphone (24 kHz)     │      Microsoft Foundry            │
-  ──────────────────────► │  gpt-realtime  (function calling) │
-                          │                                    │
-                          │  1. STT  →  intent + entity        │
-                          │  2. Tool call  →  search_user /    │
-                          │                   search_group     │
-                          │  3. Review results  →  TTS         │
-                          └────────────┬───────────────────────┘
-                                       │  REST
-                          ┌────────────▼───────────────────────┐
-                          │      Azure AI Search               │
-                          │  ┌─────────────────────────────┐   │
-                          │  │ user-slot-mapping-index      │   │
-                          │  │ group-slot-mapping-index     │   │
-                          │  └─────────────────────────────┘   │
-                          └────────────┬───────────────────────┘
-                                       │
-                          ┌────────────▼───────────────────────┐
-                          │  Multi-Strategy Search + RRF       │
-                          │  exact · fuzzy · phonetic ·        │
-                          │  normalised · field-targeted       │
-                          │  → Reciprocal Rank Fusion (K=10)   │
-                          │  → Confidence auto-confirm         │
-                          └────────────────────────────────────┘
-```
-
-### Conversation Flow
-
-1. **Voice Input** — user speaks naturally via microphone (24 kHz PCM16)
-2. **Intent + Entity Extraction** — the realtime model extracts the action verb (e.g. *call*, *log in*, *page*) and the entity name via function-calling tools
-3. **Multi-Strategy Search** — the tool queries Azure AI Search using multiple strategies in parallel and fuses results with RRF scoring
-4. **Confidence Check** — if the top result's RRF score ≥ 70 *and* the gap to #2 ≥ 25 pts, the result is auto-confirmed; otherwise the model reads the top candidates and asks the user to disambiguate
-5. **Verification** — the model reads back the matched name + ID and waits for user confirmation
+> **What this is.** A GitHub Copilot *build kit*: a set of custom instructions, prompt
+> files (slash commands), and runbooks that drive GitHub Copilot to build a voice-first,
+> latency-aware, **multi-agent** platform on top of your existing
+> [`SIRE_demo`](https://github.com/nrs2130/SIRE_demo) Voice Live repo, orchestrated with the
+> **Microsoft Agent Framework** and deployed into a **Microsoft Foundry** project.
+>
+> **Codename "Nightingale"** is a placeholder — rename freely. SIRE becomes *one* agent
+> behind the front door; this kit adds the orchestration, the other agentic workflows, and
+> the Foundry deployment.
 
 ---
 
-## Multi-Strategy Search
+## 1. The idea in one paragraph
 
-The search pipeline runs **multiple query strategies in parallel** against a single Azure AI Search index, then fuses the ranked results using **Reciprocal Rank Fusion (RRF)**. The realtime model handles **entity extraction via function-calling** and routes to the correct index — only one index is searched per tool call.
+A nurse talks to a **Vocera Smartbadge** (the "smart badge" — Stryker acquired Vocera in
+2022). Voice is the **front door**. Behind it, **Azure Voice Live API** turns speech into
+intent; a **Microsoft Agent Framework** workflow **orchestrates** a set of specialized,
+Foundry-**hosted** agents (call a doctor, prep a room, check blood supply, run the sepsis
+hour-1 bundle, read a smart-bed's real-time data, locate equipment…). Each agent reaches
+real hospital systems through **MCP tool calls** that wrap **Vocera Engage** adapters, and
+grounds its answers in **Foundry IQ** knowledge bases. The orchestrator is **latency-aware**:
+"emergency" intents (code blue, sepsis, fall) take a pre-warmed **fast path** with an
+immediate spoken acknowledgment, while slower enrichment runs **in parallel** and streams
+live voice feedback ("paging the on-call intensivist now… lactate order placed… blood bank
+confirms 2 units…").
 
-### Entity Routing
-
-The model extracts the user's intent and entity type, then calls the appropriate search tool:
-
-| User Says | Model Extracts | Tool Called | Index Searched |
-|-----------|---------------|-------------|----------------|
-| "Call Nick Stewart" | action=call, name="Nick Stewart" | `search_user` | `user-slot-mapping-index` |
-| "Log in to St. Mary's Group 3" | action=login, group="St. Mary's Group 3" | `search_group` | `group-slot-mapping-index` |
-| "Page Dr. Johnson" | action=page, name="Dr. Johnson" | `search_user` | `user-slot-mapping-index` |
-
-There is **no cross-index search** — the model decides the target based on conversational context.
-
-### User Index Strategies (up to 8)
-
-Optimised for **person name resolution** — handles STT pronunciation errors, misspellings, and partial names.
-
-| # | Strategy | Query Type | Weight | Description |
-|---|----------|-----------|--------|-------------|
-| 1 | **exact** | simple | 1.0 | Standard BM25 text search on `FirstName`, `LastName`, `FullName` |
-| 2 | **fuzzy** | full Lucene | 0.70 | `~2` edit distance for words ≥ 4 chars, `~1` otherwise — catches STT typos |
-| 3 | **targeted** | full Lucene | 2.0 | Field-targeted AND: `FirstName:X AND LastName:Y` — strongest signal when both names match (multi-word queries only) |
-| 4 | **targeted-fuzzy** | full Lucene | 1.6 | Fuzzy field-targeted AND — combines edit-distance with structured matching |
-| 5 | **targeted-phonetic** | full Lucene | 1.2 | Phonetic field-targeted AND using Double Metaphone fields |
-| 6 | **phonetic-dm** | simple | 0.50 | Double Metaphone — best general-purpose phonetic algorithm, produces two encodings per name |
-| 7 | **phonetic-soundex** | simple | 0.40 | Soundex — classic algorithm, effective for common English surname confusion ("Smith"/"Smyth") |
-| 8 | **phonetic-bm** | simple | 0.35 | Beider-Morse — cross-language name matching (Germanic, Slavic, Romance origins), higher false-positive rate |
-
-**Why phonetic search for users?** STT commonly garbles proper names ("Nguyen" → "Win", "Karen" → "Darren"). No single phonetic algorithm covers all name origins, so all three run in parallel with decreasing weights reflecting their accuracy.
-
-**Why field-targeted AND gets the highest weight (2.0)?** Matching *both* first and last name is the single strongest signal for person resolution.
-
-### Group Index Strategies (7)
-
-Optimised for **site/group name resolution** — handles number format confusion, abbreviations, and common word variations.
-
-| # | Strategy | Query Type | Weight | Description |
-|---|----------|-----------|--------|-------------|
-| 1 | **exact-all** | simple, `searchMode=all` | 1.0 | All query terms must match — highest precision |
-| 2 | **exact-any** | simple, `searchMode=any` | 0.5 | Partial term match fallback |
-| 3 | **fuzzy** | full Lucene `~1` | 0.70 | 1-edit-distance for spelling errors |
-| 4 | **normalised** | simple, `searchMode=all` | 0.85 | Number↔word conversion (`"3"` → `"three"`, `"two"` → `"2"`) before searching |
-| 5 | **normalised-any** | simple, `searchMode=any` | 0.51 | Normalised query with partial matching |
-| 6 | **fuzzy-norm** | full Lucene `~1` | 0.63 | Fuzzy search on the normalised query — combines both strategies |
-| 7 | **norm-fields** | simple, `searchMode=all` | 0.90 | Searches `*_normalized` fields with custom analyzers (`keyword_lowercase` + char mappings like `&`→`and`, `st`→`saint`) |
-
-**Why no phonetic search for groups?** Group names are multi-word phrases with common nouns ("hospital", "medical", "center") — phonetic encoding of these words would match too broadly. The main confusion source for sites spoken aloud is **number format** ("three" vs "3") and **abbreviation** ("St." vs "Saint"), which the normalisation strategies handle precisely.
-
-### Strategy Comparison
-
-| Aspect | User Index | Group Index |
-|--------|-----------|-------------|
-| **Strategies** | Up to 8 | 7 |
-| **Phonetic search** | 3 algorithms (DM, Soundex, Beider-Morse) | None |
-| **Number normalisation** | None | 3 variants + normalised-field analyzer |
-| **Field-targeted AND** | Yes (weight 2.0) | No (group names don't have first/last structure) |
-| **Highest weight** | Field-targeted AND (2.0) | Exact-all (1.0) and norm-fields (0.9) |
-| **Fuzzy edit distance** | `~2` for words ≥ 4 chars, `~1` otherwise | `~1` only |
+**One orchestration, many workflows. SIRE is just the first.**
 
 ---
 
-## Reciprocal Rank Fusion (RRF)
+## 2. What you already have vs. what this kit builds
 
-All strategies — keyword, fuzzy, phonetic, normalised, and field-targeted — are fused into a single ranking using **weighted RRF**. This is a custom client-side implementation in `search_client.py`, distinct from Azure's built-in semantic ranker.
-
-### How It Works
-
-**Step 1 — Parallel execution:** All strategies fire as separate HTTP requests to Azure AI Search simultaneously. Each returns an independently BM25-scored ranked list.
-
-**Step 2 — RRF scoring:** For every unique document that appears in any strategy's results:
-
-```
-RRF_score = Σ  weight_i / (K + rank_i)
-```
-
-Where:
-- `K = 10` — smoothing constant (low K = sharper rank sensitivity; rank #1 vs #2 matters more)
-- `rank_i` — the document's 1-based position in strategy `i`'s results
-- `weight_i` — the strategy's configured weight (e.g. 2.0 for field-targeted AND, 0.35 for Beider-Morse)
-- If a document didn't appear in a strategy, that strategy is excluded from the sum
-
-**Step 3 — Normalisation:** Raw RRF scores are mapped to 0–100:
-
-```
-normalised_score = (raw_score / max_raw_score) × 100
-```
-
-The top result always scores 100; all others are scaled proportionally.
-
-### Worked Example
-
-Query: **"Nick Stewart"** against the user index
-
-| Strategy | Weight | "Nick Stewart" Rank | RRF Contribution |
-|----------|--------|-------------------|------------------|
-| Field-targeted AND | 2.0 | #1 | 2.0 / (10 + 1) = 0.182 |
-| Exact | 1.0 | #1 | 1.0 / (10 + 1) = 0.091 |
-| Fuzzy | 0.7 | #2 | 0.7 / (10 + 2) = 0.058 |
-| Phonetic DM | 0.5 | #1 | 0.5 / (10 + 1) = 0.045 |
-| Phonetic Soundex | 0.4 | #3 | 0.4 / (10 + 3) = 0.031 |
-| Phonetic BM | 0.35 | #1 | 0.35 / (10 + 1) = 0.032 |
-| **Raw RRF total** | | | **0.439** |
-
-A correct match surfaces across **many strategies** and in **high positions**, accumulating a large RRF score. Noise results typically appear in only one or two strategies, scoring much lower.
-
-### Why Custom RRF Instead of Azure's Semantic Ranker?
-
-| Aspect | Custom Client-Side RRF | Azure Semantic Ranker |
-|--------|------------------------|----------------------|
-| **What it does** | Fuses N ranked lists from different query formulations | Reranks a single BM25 list using a cross-encoder transformer |
-| **Best for** | Short structured fields (names, codes), STT-corrupted input, entity matching | Long-form natural language text, varied phrasings |
-| **Requires vectors?** | No | No (independent of vector search) |
-| **Latency** | 1 search round-trip (~50–100ms, parallel) | +200–400ms on top of keyword search |
-| **Tuning** | Per-strategy weights, configurable K | No domain-specific tuning knobs |
-| **Why not semantic ranker here?** | "Nick Stewart" vs "Nic Stuart" is a **lexical variation** problem, not a semantic similarity problem — phonetic + fuzzy strategies catch it directly; a transformer model has no advantage on short name strings |
-
-### Confidence Detection
-
-After RRF scoring and normalisation, a result is flagged `_confident = true` when:
-
-- **Score ≥ 70** *and*
-- **Gap to next result ≥ 25 points**
-
-The `_confident` flag tells the voice model whether to **auto-confirm** the top match or **read back candidates** and ask the user to disambiguate. This avoids costly disambiguation exchanges when the result is unambiguous, while preventing incorrect auto-confirms when multiple similar entities exist.
+| Layer | Today in `SIRE_demo` | What Nightingale adds |
+|---|---|---|
+| Voice front door | Voice Live session, `gpt-realtime` function calling | Keep — becomes the **Voice Gateway**, emits a normalized *Intent Envelope* + urgency |
+| Retrieval | AI Search multi-strategy RRF (entity resolution) | Keep as the **SIRE agent** (person/group resolution), exposed via your existing `mcp_server/` |
+| Tools | 1 MCP server (SIRE search) | **Many MCP tools** wrapping Vocera adapters (HL7 labs, Patient Context REST, iBed, nurse-call, on-call scheduling) |
+| Orchestration | none (single function loop) | **Agent Framework workflow**: router + fan-out/fan-in + emergency fast path |
+| Agents | none (one model) | **Foundry hosted agents** you can see/govern in the **Control Plane** |
+| Knowledge | none | **Foundry IQ** knowledge base (sepsis & code protocols, citation-backed) |
+| Deploy | local Streamlit/CLI | **Microsoft Foundry project** with hosted agents + observability |
 
 ---
 
-## Index Schema
+## 3. The build kit (files in this repo)
 
-The application expects two Azure AI Search indexes with specific field names and custom analyzers. If your schema differs, update the field references in `search_client.py`.
+```
+.github/
+  copilot-instructions.md          # ALWAYS-ON context Copilot reads on every request
+  instructions/
+    python.instructions.md         # applies to **/*.py
+    agent-framework.instructions.md# applies to orchestrator/agent code
+  prompts/                         # each is a "/slash-command" you run in Copilot Chat
+    scaffold-repo.prompt.md        # /scaffold-repo
+    voice-gateway.prompt.md        # /voice-gateway
+    orchestrator-workflow.prompt.md# /orchestrator-workflow
+    mcp-tool.prompt.md             # /mcp-tool
+    foundry-agent.prompt.md        # /foundry-agent
+    foundry-iq-knowledge.prompt.md # /foundry-iq-knowledge
+    emergency-fastpath.prompt.md   # /emergency-fastpath
+    sepsis-workflow.prompt.md      # /sepsis-workflow
+    observability.prompt.md        # /observability
+    demo-app.prompt.md             # /demo-app  (interactive Streamlit cockpit)
+  agents/
+    agentic-architect.agent.md     # a custom "planner/architect" agent persona
+  chatmodes/
+    foundry-build.chatmode.md      # a focused chat mode for the whole build
+docs/
+  01-architecture.md               # the layered architecture + latency design
+  02-stryker-workload-catalog.md   # the 16 workloads (the "what else can we add" answer)
+  03-copilot-runbook.md            # the exact order to run the "/" commands
+```
 
-### `user-slot-mapping-index`
-
-| Field | Type | Searchable | Analyzer | Used By |
-|-------|------|-----------|----------|---------|
-| `id` | `Edm.String` (key) | — | — | Document key for RRF merge |
-| `FirstName` | `Edm.String` | Yes | `user_name_analyzer` | exact, fuzzy, targeted strategies |
-| `LastName` | `Edm.String` | Yes | `user_name_analyzer` | exact, fuzzy, targeted strategies |
-| `FullName` | `Edm.String` | Yes | `user_name_analyzer` | exact, fuzzy strategies |
-| `FirstName_phonetic` | `Edm.String` | Yes | Double Metaphone | phonetic-dm, targeted-phonetic |
-| `LastName_phonetic` | `Edm.String` | Yes | Double Metaphone | phonetic-dm, targeted-phonetic |
-| `FullName_phonetic` | `Edm.String` | Yes | Double Metaphone | phonetic-dm |
-| `FirstName_phonetic_soundex` | `Edm.String` | Yes | Soundex | phonetic-soundex |
-| `LastName_phonetic_soundex` | `Edm.String` | Yes | Soundex | phonetic-soundex |
-| `FirstName_phonetic_bm` | `Edm.String` | Yes | Beider-Morse | phonetic-bm |
-| `LastName_phonetic_bm` | `Edm.String` | Yes | Beider-Morse | phonetic-bm |
-
-### `group-slot-mapping-index`
-
-| Field | Type | Searchable | Analyzer | Used By |
-|-------|------|-----------|----------|---------|
-| `GroupID` | `Edm.String` (key) | — | — | Document key for RRF merge |
-| `GroupName` | `Edm.String` | Yes | `hospital_group_analyzer` | exact, fuzzy strategies |
-| `AlternateName1` | `Edm.String` | Yes | `hospital_group_analyzer` | exact, fuzzy strategies |
-| `AlternateName2` | `Edm.String` | Yes | `hospital_group_analyzer` | exact, fuzzy strategies |
-| `AlternateName3` | `Edm.String` | Yes | `hospital_group_analyzer` | exact, fuzzy strategies |
-| `GroupName_normalized` | `Edm.String` | Yes | `keyword_lowercase` + char mappings | norm-fields strategy |
-| `AlternateName1_normalized` | `Edm.String` | Yes | `keyword_lowercase` + char mappings | norm-fields strategy |
-| `AlternateName2_normalized` | `Edm.String` | Yes | `keyword_lowercase` + char mappings | norm-fields strategy |
-| `AlternateName3_normalized` | `Edm.String` | Yes | `keyword_lowercase` + char mappings | norm-fields strategy |
-| `AllNormalizedNames` | `Edm.String` | Yes | `keyword_lowercase` + char mappings | norm-fields strategy |
-| `GroupName_edge` | `Edm.String` | Yes | Edge n-gram | (reserved for prefix matching) |
-
-### Custom Analyzers
-
-| Analyzer | Algorithm | Applied To |
-|----------|-----------|-----------|
-| `user_name_analyzer` | Tokenizer with word delimiters, lowercase | Standard user name fields |
-| `hospital_group_analyzer` | Char mappings (`&`→`and`, `st`→`saint`), shingle, edge n-gram | Standard group name fields |
-| Double Metaphone | Phonetic token filter | `*_phonetic` fields |
-| Soundex | Phonetic token filter | `*_phonetic_soundex` fields |
-| Beider-Morse | Phonetic token filter | `*_phonetic_bm` fields |
-| `keyword_lowercase` + char mappings | Number-word normalisation (`3`→`three`) | `*_normalized` fields |
-
-### Where to Change If Your Schema Differs
-
-All field name references are in **`search_client.py`**, in two methods:
-
-| Location | What to change |
-|----------|---------------|
-| `search_user()` (~line 108) | `select`, `key_field`, `std_fields`, `phonetic_fields`, `soundex_fields`, `bm_fields` |
-| `search_group()` (~line 92) | `select`, `key_field`, `std_fields`, `norm_fields`, `edge_fields` |
-| `_build_user_strategies()` (~line 207) | Field-targeted AND logic assumes `FirstName` + `LastName` split — update if your name fields differ |
-| `_build_group_strategies()` (~line 132) | Number normalisation and norm-field queries — update field names to match your index |
-| `config.py` / `.env` | Index names (`AZURE_SEARCH_GROUP_INDEX`, `AZURE_SEARCH_USER_INDEX`) |
+**How the pieces relate**
+- `copilot-instructions.md` is loaded automatically on every Copilot request — it's the
+  guardrails and glossary so Copilot always knows the stack, the layers, and the rules.
+- `*.instructions.md` add path-specific rules (Python style, Agent Framework patterns).
+- `*.prompt.md` are **reusable tasks you invoke with `/`** — one per build phase.
+- `*.agent.md` / `*.chatmode.md` give Copilot a focused role for the whole effort.
+- `docs/` is the human-readable design + the step-by-step runbook.
 
 ---
 
-## Running the App
+## 4. Quick start (10 minutes to first slash command)
 
-### Prerequisites
+> Prereqs: VS Code (latest), GitHub Copilot enabled, Python 3.11+, Azure CLI (`az login`),
+> access to a **Microsoft Foundry** project with a `gpt-realtime` (Voice Live) deployment
+> and an Azure AI Search service.
 
-| Requirement | Details |
-|-------------|---------|
-| **Python** | 3.11 or later |
-| **Azure AI Foundry** | A Foundry resource with a **`gpt-realtime`** model deployment |
-| **Azure AI Search** | A search service with `user-slot-mapping-index` and `group-slot-mapping-index` configured with phonetic + normalised analyzers (see [Indexes](#indexes)) |
-| **Azure CLI** | `az login` required for Entra ID authentication (recommended over API keys) |
-| **Microphone + Speakers** | Any system audio devices — the app auto-detects defaults, or you can specify device indices in `.env` |
-| **PortAudio** | macOS only: `brew install portaudio` (required by PyAudio) |
+1. **Create the new repo** and copy the whole `.github/` and `docs/` folders from this kit
+   into it. (Or start from a fork of `SIRE_demo` and drop these in.)
+2. **Open the repo in VS Code.** Confirm Copilot picks up the customizations:
+   Chat view → gear icon → *Instructions* / *Prompt Files* should list the files above.
+3. **Wire up MCP** so Copilot's Agent mode can call your SIRE tools while it builds. Create
+   `.vscode/mcp.json` (the `/scaffold-repo` prompt does this for you) pointing at the
+   existing `mcp_server/`.
+4. **Open Copilot Chat, switch to Agent mode**, pick a strong model, and select the
+   **`Foundry Build`** chat mode (from `chatmodes/`).
+5. **Run the runbook.** Follow `docs/03-copilot-runbook.md` — it's just a sequence of slash
+   commands starting with `/scaffold-repo`.
 
-### Setup
+---
+
+## 5. How to drive GitHub Copilot (the "/" commands)
+
+GitHub Copilot's customization model has four moving parts you'll use here. See
+`docs/03-copilot-runbook.md` for the exact sequence; this is the cheat sheet.
+
+**A. Built-in slash commands** (type `/` in Copilot Chat):
+- `/init` — generate a first `.github/copilot-instructions.md` from your codebase. *(We ship
+  a better one — use `/init` only if you want Copilot to refresh it after big changes.)*
+- `/explain`, `/fix`, `/tests`, `/doc` — explain code, propose fixes, generate tests, write docs.
+- `/create-prompt`, `/create-instruction`, `/create-agent` — scaffold **new** customization
+  files with AI help (use these to add more workflows later).
+
+**B. Your prompt files as slash commands.** Every file in `.github/prompts/*.prompt.md`
+shows up in chat as `/<filename>`. Example: `/sepsis-workflow` runs the whole sepsis build
+task with the context and acceptance criteria baked in. You can pass an argument, e.g.
+`/mcp-tool blood-bank`.
+
+**C. Context variables** (type `#` or `@` in chat) — feed Copilot the right context:
+- `#codebase` (or `@workspace`) — let Copilot search the whole repo.
+- `#file:search_client.py` — pin a specific file into context.
+- `#fetch https://learn.microsoft.com/...` — **pull live docs** so Copilot uses the *current*
+  Agent Framework / Foundry / Voice Live APIs instead of guessing. **Use this a lot** — these
+  SDKs move fast.
+- `#githubRepo nrs2130/SIRE_demo` — reference the original repo for patterns.
+
+**D. Agent mode + MCP.** Switch Copilot Chat to **Agent mode** for multi-file, multi-step
+edits. Register MCP servers in `.vscode/mcp.json` so Copilot can actually *call* your SIRE
+search tools (and the new mock adapters) while building and testing.
+
+> **Golden rule for accuracy:** the Microsoft Agent Framework, Foundry Agent Service, and
+> Voice Live SDKs are evolving. Before writing SDK code, every prompt file tells Copilot to
+> (1) `#fetch` the authoritative Microsoft Learn page, (2) pull a **working example** from the
+> official samples repo `#githubRepo microsoft-foundry/foundry-samples` (start in
+> `samples/python/`; `samples/csharp/` for .NET, `infrastructure/` for Bicep deploy templates)
+> and **adapt** it, and (3) **pin exact package versions**. Docs are the contract; the samples
+> repo is the reference implementation. Treat the code Copilot writes as a draft to run, not gospel.
+
+---
+
+## 6. The architecture at a glance
+
+```
+ ┌──────────────┐  voice   ┌───────────────────────────────────────────────┐
+ │ Vocera        │◀────────▶│  L1  VOICE GATEWAY  (Azure Voice Live)         │
+ │ Smartbadge    │  (badge  │  gpt-realtime → IntentEnvelope{intent,entities,│
+ │  + panic btn  │  or web) │  urgency=EMERGENCY|ROUTINE, patient_ctx}       │
+ └──────────────┘          └───────────────┬───────────────────────────────┘
+                                            │  (urgency decided cheaply, here)
+                       ┌────────────────────▼─────────────────────┐
+                       │  L2  ORCHESTRATOR (Microsoft Agent        │
+                       │       Framework Workflow — a graph)       │
+                       │   ROUTER → { fast-path | standard-path }  │
+                       │   fan-out ∥ … ∥ fan-in barrier            │
+                       │   streams intermediate events → voice     │
+                       └───┬───────────┬───────────┬───────────────┘
+             ┌─────────────▼──┐ ┌──────▼───────┐ ┌─▼──────────────┐
+             │ L3 Comms/Escal.│ │ L3 Sepsis    │ │ L3 SIRE (entity│  … hosted in
+             │    agent       │ │    agent     │ │   resolution)  │  Foundry Agent
+             └───────┬────────┘ └──────┬───────┘ └─────┬──────────┘  Service
+                     │ MCP tool calls  │                │            (Control Plane)
+        ┌────────────▼─────────────────▼────────────────▼─────────────┐
+        │ L4 TOOLS = MCP servers wrapping Vocera Engage adapters        │
+        │  on-call sched · HL7 labs · Patient Context REST · iBed bed   │
+        │  telemetry · nurse-call SIP · monitor adapters · blood bank   │
+        └───────────────────────────────┬──────────────────────────────┘
+                        ┌────────────────▼─────────────────┐
+                        │ L4b  FOUNDRY IQ knowledge base    │
+                        │  (Azure AI Search): sepsis / code │
+                        │  protocols, citation-backed RAG   │
+                        └───────────────────────────────────┘
+```
+
+Full detail — including the **latency-aware fast path**, the fan-out/fan-in patterns, and
+the mapping to Agent Framework primitives — is in **`docs/01-architecture.md`**.
+
+---
+
+## 7. The other agentic workflows (your "what else can we add?")
+
+Short answer: the "smart badge" is **Vocera**, and Stryker already ships the whole stack —
+the badge, the **Engage** workflow/alarm middleware (150+ documented integrations),
+connected **ProCuity** beds, **LIFENET/LIFEPAK**, **Triton** blood-loss, and a public
+**adapter catalog that reads like a menu of agent tools**. So beyond SIRE you can credibly
+demo: **code blue activation**, **rapid response**, **sepsis hour-1 bundle**, **fall /
+bed-exit response**, **monitor-alarm triage**, **postpartum-hemorrhage / massive transfusion**,
+**STEMI/stroke pre-alert**, **locate/request equipment**, **on-call/consult resolution**,
+**critical lab-value callback**, and **shift-handoff lookup**.
+
+The full catalog — each mapped to the real Vocera/Stryker integration it would use, tagged
+🔴 emergency vs 🟢 routine, with sources — is in **`docs/02-stryker-workload-catalog.md`**.
+
+> **Integrity note for the workshop:** position the agent as an **LLM orchestration layer
+> _above_ Vocera Engage**, *augmenting* the routing/alarm path — not replacing it. Engage's
+> alarm notification (EMDAN) is **FDA 510(k)-cleared**, so anything touching clinical alarms
+> is **human-in-the-loop**. Field-level device schemas, a Stryker-native RTLS, and an open
+> third-party FHIR API are **not publicly documented** — mark them "to confirm with Stryker."
+> Drawing that line makes you *more* credible, not less.
+
+---
+
+## 8. Suggested demo spine (for the workshop)
+
+1. **Routine loop first** — "Call the on-call hospitalist." Proves voice → intent → tool →
+   spoken confirmation (reuses SIRE entity resolution).
+2. **Emergency, multi-agent** — "I have a patient with suspected sepsis in bed 12." Shows the
+   **fast path**, **parallel** order-placement + paging + a compliance **timer**, and **live
+   voice feedback** while slow steps run — the money shot for latency-aware orchestration.
+3. **Control plane tab** — flip to Foundry to show the **hosted agents**, their tool calls,
+   and traces. This is what makes it feel like a *platform*, not a script.
+
+---
+
+## 9. Is it interactive? Yes — the Streamlit cockpit
+
+After it's built and deployed, you drive everything through an **interactive Streamlit app**
+(built by `/demo-app`, extending `SIRE_demo`'s existing `streamlit_app.py`). It's the presenter's
+cockpit and it's what makes the orchestration *visible*:
+- a **badge simulator** — mic **and** a text box (for mic-less/CI demos) **and** a red **PANIC**
+  button that forces an emergency route;
+- the **live transcript**, including the acknowledgment-first message on emergencies;
+- an **orchestration cockpit** showing the routing decision, each **concurrent branch** with a
+  live **elapsed-vs-budget** timer (green within budget, amber + "still working…" on breach), and
+  the agent/tool call log;
+- the **sepsis hour-1 checklist** ticking off and the **compliance timer**; and
+- a **Control Plane link** to the Foundry view of the hosted agents + traces for the run.
+
+**Two topologies** (toggle in the app — see `docs/01-architecture.md` §9):
+**(A) local orchestrator** calling Foundry hosted agents/tools remotely — best for the workshop,
+maximum visibility; **(B) fully hosted** orchestrator with the app as a thin client — more
+production-like. Both run against **mock MCP tools**, so no real hospital systems are needed to
+demo. Start with (A).
+
+## 10. Where to go next
+
+- Read `docs/01-architecture.md` (design) → `docs/02-stryker-workload-catalog.md` (scope) →
+  `docs/03-copilot-runbook.md` (do it).
+- Then open Copilot Chat and run `/scaffold-repo`. Finish the build with `/demo-app`.
+
+---
+
+## 11. Development (contributing)
+
+The `/scaffold-repo` step lays down the source layout (`src/gateway`, `src/orchestrator`,
+`src/agents`, `src/tools`, `src/knowledge`, `src/telemetry`), a typed `config.py`, pinned
+`requirements.txt`, and the `pytest` harness. To work on the platform locally:
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/nrs2130/SIRE_demo.git
-cd SIRE_demo
-
-# 2. Create a virtual environment (recommended)
+# 1. Create and activate a virtual environment (Python 3.11+)
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS/Linux
+# Windows:  .venv\Scripts\Activate.ps1
+# macOS/Linux:  source .venv/bin/activate
 
-# 3. Install dependencies
+# 2. Install pinned dependencies
 pip install -r requirements.txt
 
-# 4. Configure environment
-copy .env.example .env        # Windows
-# cp .env.example .env        # macOS/Linux
-# Then edit .env with your Azure endpoints and keys
+# 3. Configure environment (never commit .env — it's git-ignored)
+copy .env.example .env      # Windows  (cp on macOS/Linux)
+#   Fill in Voice Live + AI Search values. Foundry/telemetry vars are optional
+#   locally — the orchestrator runs against mock MCP tools without them.
 
-# 5. Login to Azure (for Entra ID / token-based auth)
-az login
+# 4. Run the tests
+pytest
 ```
 
-### CLI Mode (terminal)
+**Running against mocks.** Every component's definition of done is that it runs locally
+against **mock MCP tools** with no real hospital systems. The mock adapters live in
+`src/tools/` and share the same MCP interface as the (future) real Vocera Engage adapters, so
+swapping mock → real is a config change, not a rewrite. The existing SIRE search tool is
+registered in `.vscode/mcp.json` so Copilot Agent mode can call it while you build.
 
-```bash
-python main.py --use-token-credential          # Entra ID auth
-python main.py --use-token-credential --verbose # with DEBUG logging
-```
-
-### Streamlit UI
-
-```bash
-python -m streamlit run streamlit_app.py
-```
-
-The Streamlit app provides:
-
-- **START / STOP** session controls
-- **Live transcript** panel (user + assistant turns)
-- **Intent & Best Match** panel — shows the extracted intent, entity, top result with score, and whether it was auto-confirmed or needs disambiguation
-- **Search results** table with RRF scores and contributing strategies
-- **Manual search test** — run ad-hoc queries against either index without a voice session
-
----
-
-## Environment Variables
-
-Copy the example file and fill in your values:
-
-```bash
-copy .env.example .env        # Windows
-# cp .env.example .env        # macOS/Linux
-```
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `AZURE_VOICELIVE_ENDPOINT` | **Yes** | — | Azure AI Foundry resource endpoint |
-| `AZURE_VOICELIVE_API_KEY` | No | — | API key (leave blank for Entra ID auth) |
-| `AZURE_VOICELIVE_USE_TOKEN` | No | `false` | Set to `true` for Entra ID / `AzureCliCredential` |
-| `AZURE_VOICELIVE_MODEL` | No | `gpt-realtime` | Realtime model deployment name |
-| `AZURE_VOICELIVE_VOICE` | No | `en-US-Ava:DragonHDLatestNeural` | Azure Neural Voice for TTS |
-| `AZURE_SEARCH_ENDPOINT` | **Yes** | — | Azure AI Search service endpoint |
-| `AZURE_SEARCH_API_KEY` | **Yes** | — | Search service admin or query API key |
-| `AZURE_SEARCH_GROUP_INDEX` | No | `group-slot-mapping-index` | Group index name |
-| `AZURE_SEARCH_USER_INDEX` | No | `user-slot-mapping-index` | User index name |
-| `AZURE_SEARCH_API_VERSION` | No | `2024-07-01` | Search REST API version |
-| `AUDIO_INPUT_DEVICE_INDEX` | No | OS default | Microphone device index (leave blank for auto-detect) |
-| `AUDIO_OUTPUT_DEVICE_INDEX` | No | OS default | Speaker device index (leave blank for auto-detect) |
-
-See [.env.example](.env.example) for the full template with comments.
-
----
-
-## Files
-
-| File | Purpose |
-|------|---------|
-| `main.py` | Voice agent entry point — VoiceLive session, event loop, function-call dispatch with intent extraction |
-| `search_client.py` | Async multi-strategy Azure AI Search client with RRF scoring and confidence detection |
-| `config.py` | Typed dataclass configuration loaded from `.env` |
-| `streamlit_app.py` | Streamlit web UI — session controls, live transcript, search results, manual test |
-| `export_indexes.py` | Export top records from each AI Search index to `SIRE_AI_Search_Data.xlsx` |
-| `test_enhanced_search.py` | Test harness for multi-strategy search with sample queries |
-| `setup_mcp_ai_search.ps1` | PowerShell script to configure the MCP AI Search connector |
-| `mcp_server/` | MCP (Model Context Protocol) server — exposes search tools to MCP clients (VS Code Copilot, Claude Desktop, etc.) |
-| `.env.example` | Environment variable template — copy to `.env` and fill in values |
-| `.env` | Your environment variables (gitignored — never committed) |
-| `requirements.txt` | Python dependencies |
-
----
-
-## CLI Options
-
-```
-python main.py [--use-token-credential] [--verbose]
-```
-
-| Flag | Description |
-|------|-------------|
-| `--use-token-credential` | Use `AzureCliCredential` (Entra ID) instead of API key |
-| `--verbose` | Enable DEBUG logging |
+**Conventions** (see `.github/instructions/`): Python 3.11+, full type hints, `async`/`await`
+for all I/O, config from environment via the typed dataclasses in `config.py`, and
+OpenTelemetry spans on every orchestrator node and tool call. Format with `black` + `ruff`;
+each component ships a `pytest` test (happy path + one timeout/failure path).

@@ -6,6 +6,10 @@
 *.pyc
 *.pyo
 
+# Testing
+.pytest_cache/
+.venv/
+
 # Logs
 logs/
 
