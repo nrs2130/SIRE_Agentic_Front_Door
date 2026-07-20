@@ -46,6 +46,14 @@ from .monitor_alarm import (
     read_monitor,
 )
 from .monitor_alarm import build_server as build_monitor_server
+from .blood_bank import (
+    BloodBankAdapter,
+    BloodBankResult,
+    ProductAvailability,
+    check_blood_bank,
+    create_blood_bank_adapter,
+)
+from .blood_bank import build_server as build_blood_bank_server
 
 __all__ = [
     # oncall_lookup
@@ -88,4 +96,11 @@ __all__ = [
     "build_monitor_server",
     "create_monitor_adapter",
     "read_monitor",
+    # blood_bank (read-only)
+    "BloodBankAdapter",
+    "BloodBankResult",
+    "ProductAvailability",
+    "build_blood_bank_server",
+    "create_blood_bank_adapter",
+    "check_blood_bank",
 ]

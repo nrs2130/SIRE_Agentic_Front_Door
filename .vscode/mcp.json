@@ -60,6 +60,14 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // Copy the block above and rename for the next tool (blood_bank, equipment_locate, …).
+    // blood_bank: READ-ONLY blood-product availability + crossmatch (LIS via HL7/Scripted).
+    ,"blood-bank": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "blood_bank"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+    // Copy the block above and rename for the next tool (equipment_locate, …).
   }
 }
