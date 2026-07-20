@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-_TOOLS = {"oncall_lookup", "comms_page", "labs_hl7"}
+_TOOLS = {"oncall_lookup", "comms_page", "labs_hl7", "patient_context"}
 
 
 def main() -> None:
@@ -27,6 +27,10 @@ def main() -> None:
         from src.tools.labs_hl7 import main as run_labs
 
         run_labs()
+    elif tool == "patient_context":
+        from src.tools.patient_context import main as run_patient
+
+        run_patient()
 
 
 if __name__ == "__main__":

@@ -35,6 +35,14 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // Copy the block above and rename for the next tool (patient_context, bed_telemetry, …).
+    // patient_context: reads patient identity + care team via Vocera Patient Context REST.
+    ,"patient-context": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "patient_context"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+    // Copy the block above and rename for the next tool (bed_telemetry, blood_bank, …).
   }
 }

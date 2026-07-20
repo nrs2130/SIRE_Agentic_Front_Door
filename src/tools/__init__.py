@@ -23,6 +23,14 @@ from .oncall_lookup import (
     lookup_oncall,
 )
 from .oncall_lookup import build_server as build_oncall_server
+from .patient_context import (
+    CareTeamMember,
+    PatientContextAdapter,
+    PatientContextResult,
+    create_patient_context_adapter,
+    get_patient_context,
+)
+from .patient_context import build_server as build_patient_context_server
 
 __all__ = [
     # oncall_lookup
@@ -45,4 +53,11 @@ __all__ = [
     "build_labs_server",
     "create_labs_adapter",
     "order_labs",
+    # patient_context
+    "PatientContextAdapter",
+    "PatientContextResult",
+    "CareTeamMember",
+    "build_patient_context_server",
+    "create_patient_context_adapter",
+    "get_patient_context",
 ]
