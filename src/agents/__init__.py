@@ -9,6 +9,14 @@ from .comms import (
 )
 from .hosted import HostedAgentSpec, HostedMCPTool, register_hosted_agent
 from .registry import agent_for_intent, register_agent, registrations
+from .sepsis import (
+    SEPSIS_INTENTS,
+    Hour1Step,
+    SepsisAgent,
+    SepsisAgentResult,
+    create_sepsis_agent,
+    sepsis_hosted_agent_spec,
+)
 
 __all__ = [
     "CommsAgent",
@@ -16,6 +24,12 @@ __all__ = [
     "COMMS_INTENTS",
     "create_comms_agent",
     "comms_hosted_agent_spec",
+    "SepsisAgent",
+    "SepsisAgentResult",
+    "Hour1Step",
+    "SEPSIS_INTENTS",
+    "create_sepsis_agent",
+    "sepsis_hosted_agent_spec",
     "HostedAgentSpec",
     "HostedMCPTool",
     "register_hosted_agent",

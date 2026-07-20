@@ -15,10 +15,12 @@ from config import FoundryConfig
 
 from .comms import comms_hosted_agent_spec
 from .hosted import HostedAgentSpec, register_hosted_agent
+from .sepsis import sepsis_hosted_agent_spec
 
 # Capability -> hosted-agent spec factory. New agents add themselves here.
 _SPECS: dict[str, callable] = {
     "comms": comms_hosted_agent_spec,
+    "sepsis": sepsis_hosted_agent_spec,
 }
 
 

@@ -30,6 +30,23 @@ class HostedMCPTool:
     server_url: str  # URL of the hosted MCP server endpoint
     allowed_tools: tuple[str, ...]  # which tools from that server the agent may call
     require_approval: str = "never"  # never | always (tool-call approval workflow)
+    # Foundry project connection id, required for a Foundry IQ knowledge-base MCP tool
+    # (RemoteTool/ProjectManagedIdentity connection). None for plain bring-your-own MCP.
+    project_connection_id: str | None = None
+
+
+def _hosted_tool_plan(t: HostedMCPTool) -> dict:
+    """Serialize one hosted MCP tool for the plan (omits unset optional fields)."""
+    plan = {
+        "type": "mcp",
+        "server_label": t.server_label,
+        "server_url": t.server_url,
+        "allowed_tools": list(t.allowed_tools),
+        "require_approval": t.require_approval,
+    }
+    if t.project_connection_id is not None:
+        plan["project_connection_id"] = t.project_connection_id
+    return plan
 
 
 @dataclass(frozen=True)
@@ -50,16 +67,7 @@ class HostedAgentSpec:
                 "name": self.name,
                 "model": self.model,
                 "instructions": self.instructions,
-                "tools": [
-                    {
-                        "type": "mcp",
-                        "server_label": t.server_label,
-                        "server_url": t.server_url,
-                        "allowed_tools": list(t.allowed_tools),
-                        "require_approval": t.require_approval,
-                    }
-                    for t in self.mcp_tools
-                ],
+                "tools": [_hosted_tool_plan(t) for t in self.mcp_tools],
             },
             "auth": "DefaultAzureCredential",
         }
@@ -96,12 +104,19 @@ def register_hosted_agent(
     with DefaultAzureCredential() as credential, AIProjectClient(
         endpoint=project_endpoint, credential=credential
     ) as client:
-        # TODO: verify exact create signature against the installed azure-ai-projects
-        # 2.3.0 (hosted agents are GA there). The documented pattern is a declarative
-        # agent definition (model + instructions + MCP tool defs) created via
-        # client.agents.create_version(...). Symbol names are intentionally not invented
-        # here beyond the client/credential; wire the concrete call when running for real.
-        # See https://learn.microsoft.com/agent-framework/agents/tools/hosted-mcp-tools
+        # Verified pattern (azure-ai-projects>=2.0.0; repo pins 2.3.0) from
+        # https://learn.microsoft.com/azure/foundry/agents/how-to/foundry-iq-connect
+        # (fetched 2026-07-20):
+        #   from azure.ai.projects.models import PromptAgentDefinition, MCPTool
+        #   tools = [MCPTool(server_label=..., server_url=..., require_approval="never",
+        #                    allowed_tools=[...], project_connection_id=...)]
+        #   client.agents.create_version(agent_name=spec.name,
+        #       definition=PromptAgentDefinition(model=spec.model,
+        #           instructions=spec.instructions, tools=tools))
+        # Foundry IQ knowledge-base tools additionally require a RemoteTool project
+        # connection (ProjectManagedIdentity) created via ARM before this call.
+        # TODO: wire the concrete create_version call + connection provisioning when
+        # running for real (kept dry-run-only here to avoid unverified side effects).
         raise NotImplementedError(
             "Real hosted-agent creation is not wired yet. Run with --dry-run to see the "
             "plan; implement client.agents.create_version(...) per the pinned "
