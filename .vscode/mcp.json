@@ -68,6 +68,13 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // Copy the block above and rename for the next tool (equipment_locate, …).
+    // equipment_locate: READ-ONLY last-seen equipment location (Stryker RTLS + ProCare).
+    ,"equipment-locate": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "equipment_locate"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
   }
 }

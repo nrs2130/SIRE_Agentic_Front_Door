@@ -54,6 +54,14 @@ from .blood_bank import (
     create_blood_bank_adapter,
 )
 from .blood_bank import build_server as build_blood_bank_server
+from .equipment_locate import (
+    EquipmentLocateAdapter,
+    EquipmentLocateResult,
+    EquipmentUnit,
+    create_equipment_locate_adapter,
+    locate_equipment,
+)
+from .equipment_locate import build_server as build_equipment_locate_server
 
 __all__ = [
     # oncall_lookup
@@ -103,4 +111,11 @@ __all__ = [
     "build_blood_bank_server",
     "create_blood_bank_adapter",
     "check_blood_bank",
+    # equipment_locate (read-only)
+    "EquipmentLocateAdapter",
+    "EquipmentLocateResult",
+    "EquipmentUnit",
+    "build_equipment_locate_server",
+    "create_equipment_locate_adapter",
+    "locate_equipment",
 ]

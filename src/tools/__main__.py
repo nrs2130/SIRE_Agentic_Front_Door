@@ -10,7 +10,7 @@ import sys
 
 _TOOLS = {
     "oncall_lookup", "comms_page", "labs_hl7", "patient_context",
-    "bed_telemetry", "monitor_alarm", "blood_bank",
+    "bed_telemetry", "monitor_alarm", "blood_bank", "equipment_locate",
 }
 
 
@@ -46,6 +46,10 @@ def main() -> None:
         from src.tools.blood_bank import main as run_blood
 
         run_blood()
+    elif tool == "equipment_locate":
+        from src.tools.equipment_locate import main as run_equip
+
+        run_equip()
 
 
 if __name__ == "__main__":
