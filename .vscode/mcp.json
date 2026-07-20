@@ -43,6 +43,14 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // Copy the block above and rename for the next tool (bed_telemetry, blood_bank, …).
+    // bed_telemetry: reads Stryker smart-bed telemetry (iBed Adapter, ProCuity -> Engage).
+    ,"bed-telemetry": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "bed_telemetry"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+    // Copy the block above and rename for the next tool (blood_bank, equipment_locate, …).
   }
 }

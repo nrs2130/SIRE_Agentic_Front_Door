@@ -31,6 +31,13 @@ from .patient_context import (
     get_patient_context,
 )
 from .patient_context import build_server as build_patient_context_server
+from .bed_telemetry import (
+    BedTelemetryAdapter,
+    BedTelemetryResult,
+    create_bed_telemetry_adapter,
+    read_bed_telemetry,
+)
+from .bed_telemetry import build_server as build_bed_telemetry_server
 
 __all__ = [
     # oncall_lookup
@@ -60,4 +67,10 @@ __all__ = [
     "build_patient_context_server",
     "create_patient_context_adapter",
     "get_patient_context",
+    # bed_telemetry
+    "BedTelemetryAdapter",
+    "BedTelemetryResult",
+    "build_bed_telemetry_server",
+    "create_bed_telemetry_adapter",
+    "read_bed_telemetry",
 ]
