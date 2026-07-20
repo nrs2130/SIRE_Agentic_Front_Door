@@ -119,6 +119,30 @@ class TelemetryConfig:
 
 
 @dataclass(frozen=True)
+class ToolsConfig:
+    """L4 MCP tool configuration (mock adapters + realistic latency simulation).
+
+    ``use_real_adapter`` flips a tool from its demo mock to the real Vocera Engage
+    adapter without a code change. ``mock_latency_ms`` / ``mock_jitter_ms`` make the
+    mock's latency demoable; ``timeout_ms`` bounds every tool call so a slow adapter
+    surfaces as a typed timeout result instead of hanging the orchestrator.
+    """
+    use_real_adapter: bool
+    mock_latency_ms: int
+    mock_jitter_ms: int
+    timeout_ms: int
+
+    @classmethod
+    def from_env(cls) -> "ToolsConfig":
+        return cls(
+            use_real_adapter=os.getenv("TOOLS_USE_REAL_ADAPTER", "false").lower() == "true",
+            mock_latency_ms=int(os.getenv("TOOLS_MOCK_LATENCY_MS", "250")),
+            mock_jitter_ms=int(os.getenv("TOOLS_MOCK_JITTER_MS", "150")),
+            timeout_ms=int(os.getenv("TOOLS_TIMEOUT_MS", "3000")),
+        )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level application configuration."""
     voicelive: VoiceLiveConfig
@@ -126,6 +150,7 @@ class AppConfig:
     foundry: FoundryConfig
     budgets: LatencyBudgets
     telemetry: TelemetryConfig
+    tools: ToolsConfig
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -135,4 +160,5 @@ class AppConfig:
             foundry=FoundryConfig.from_env(),
             budgets=LatencyBudgets.from_env(),
             telemetry=TelemetryConfig.from_env(),
+            tools=ToolsConfig.from_env(),
         )

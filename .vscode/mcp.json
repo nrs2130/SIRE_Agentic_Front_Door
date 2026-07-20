@@ -10,16 +10,15 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // --- Placeholder for additional local MCP tool servers (added by /mcp-tool) ---
-    // Each new Vocera Engage adapter (mock or real) is registered here so Copilot
-    // and the orchestrator can invoke it. Copy the block below and rename:
-    //
-    // ,"oncall-lookup": {
-    //   "type": "stdio",
-    //   "command": "python",
-    //   "args": ["-m", "src.tools.oncall_lookup"],
-    //   "cwd": "${workspaceFolder}",
-    //   "env": {}
-    // }
+    // --- Local MCP tool servers (Vocera Engage adapter wrappers, added by /mcp-tool) ---
+    // oncall_lookup: resolves role -> on-call person (AMiON/QGenda/Spok/Lightning Bolt).
+    ,"oncall-lookup": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "oncall_lookup"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+    // Copy the block above and rename for the next tool (comms_page, labs_hl7, …).
   }
 }
