@@ -51,6 +51,15 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
+    // monitor_alarm: READ-ONLY vitals + alarm state (GE Carescape / Nihon Kohden / etc.).
+    // Read/notify-only; never touches the FDA-cleared alarm path.
+    ,"monitor-alarm": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "monitor_alarm"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
     // Copy the block above and rename for the next tool (blood_bank, equipment_locate, …).
   }
 }

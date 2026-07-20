@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-_TOOLS = {"oncall_lookup", "comms_page", "labs_hl7", "patient_context", "bed_telemetry"}
+_TOOLS = {"oncall_lookup", "comms_page", "labs_hl7", "patient_context", "bed_telemetry", "monitor_alarm"}
 
 
 def main() -> None:
@@ -35,6 +35,10 @@ def main() -> None:
         from src.tools.bed_telemetry import main as run_bed
 
         run_bed()
+    elif tool == "monitor_alarm":
+        from src.tools.monitor_alarm import main as run_monitor
+
+        run_monitor()
 
 
 if __name__ == "__main__":

@@ -38,6 +38,14 @@ from .bed_telemetry import (
     read_bed_telemetry,
 )
 from .bed_telemetry import build_server as build_bed_telemetry_server
+from .monitor_alarm import (
+    MonitorAdapter,
+    MonitorAlarmResult,
+    VitalSign,
+    create_monitor_adapter,
+    read_monitor,
+)
+from .monitor_alarm import build_server as build_monitor_server
 
 __all__ = [
     # oncall_lookup
@@ -73,4 +81,11 @@ __all__ = [
     "build_bed_telemetry_server",
     "create_bed_telemetry_adapter",
     "read_bed_telemetry",
+    # monitor_alarm (read-only)
+    "MonitorAdapter",
+    "MonitorAlarmResult",
+    "VitalSign",
+    "build_monitor_server",
+    "create_monitor_adapter",
+    "read_monitor",
 ]
