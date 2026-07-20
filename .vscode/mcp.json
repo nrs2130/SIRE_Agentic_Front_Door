@@ -19,6 +19,14 @@
       "cwd": "${workspaceFolder}",
       "env": {}
     }
-    // Copy the block above and rename for the next tool (comms_page, labs_hl7, …).
+    // comms_page: hands a page/notification to Vocera Engage escalation + Smartbadge.
+    ,"comms-page": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "src.tools", "comms_page"],
+      "cwd": "${workspaceFolder}",
+      "env": {}
+    }
+    // Copy the block above and rename for the next tool (labs_hl7, patient_context, …).
   }
 }

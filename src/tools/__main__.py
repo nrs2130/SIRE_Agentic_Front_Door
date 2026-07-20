@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import sys
 
-_TOOLS = {"oncall_lookup"}
+_TOOLS = {"oncall_lookup", "comms_page"}
 
 
 def main() -> None:
@@ -19,6 +19,10 @@ def main() -> None:
         from src.tools.oncall_lookup import main as run_oncall
 
         run_oncall()
+    elif tool == "comms_page":
+        from src.tools.comms_page import main as run_comms
+
+        run_comms()
 
 
 if __name__ == "__main__":
