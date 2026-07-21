@@ -505,6 +505,264 @@ def _agent_thread(state: AgentState, search_backend: str = "python"):
 
 
 # ---------------------------------------------------------------------------
+# Nightingale Cockpit (L6 presentation) — badge simulator + orchestration cockpit
+#
+# Thin renderer over src/demo/cockpit.py. The orchestration client logic lives in
+# that module (Streamlit-independent + unit-tested); this only draws widgets and
+# polls the live CockpitState. Runs against the mock MCP tools, no Azure required.
+# ---------------------------------------------------------------------------
+
+_COCKPIT_CSS = """
+<style>
+.branch-row { margin: 6px 0; }
+.branch-bar-bg { background:#eee; border-radius:6px; height:18px; width:100%; overflow:hidden; }
+.branch-bar { height:18px; border-radius:6px; }
+.bar-green { background:#43a047; }
+.bar-amber { background:#fb8c00; }
+.bar-grey  { background:#bdbdbd; }
+.ack-line { background:#ffebee; padding:8px 12px; border-radius:8px; margin:4px 0; border-left:4px solid #e53935; font-weight:600; }
+.nurse-line { background:#e3f2fd; padding:8px 12px; border-radius:8px; margin:4px 0; border-left:4px solid #1976d2; }
+.agent-line { background:#f3e5f5; padding:6px 12px; border-radius:8px; margin:3px 0; border-left:4px solid #7b1fa2; }
+.badge-fast { background:#e53935; color:#fff; padding:3px 10px; border-radius:12px; font-weight:700; }
+.badge-std  { background:#1976d2; color:#fff; padding:3px 10px; border-radius:12px; font-weight:700; }
+</style>
+"""
+
+
+def _fmt_mmss(seconds: float) -> str:
+    m, s = divmod(int(max(0, seconds)), 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def _render_cockpit() -> None:
+    """Render the Nightingale badge simulator + orchestration cockpit."""
+    from config import AppConfig, ToolsConfig  # noqa: PLC0415
+    from src.demo import cockpit as ck  # noqa: PLC0415  (lazy: keeps SIRE path independent)
+
+    st.markdown(_COCKPIT_CSS, unsafe_allow_html=True)
+    st.title("🏥 Nightingale — Agentic Front Door")
+    st.caption("Voice-first · latency-aware · multi-agent orchestration for hospital nurses")
+
+    cfg = AppConfig.from_env()
+    budgets = cfg.budgets
+
+    if "cockpit_state" not in st.session_state:
+        st.session_state["cockpit_state"] = ck.CockpitState()
+    cstate: ck.CockpitState = st.session_state["cockpit_state"]
+
+    # ── Sidebar: backend topology + demo pacing ─────────────────────────
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Backend topology")
+        topo = st.radio(
+            "Orchestrator",
+            ["Local (A)", "Hosted (B)"],
+            help=(
+                "**Local (A)** — the orchestrator runs here, calling Foundry hosted agents + "
+                "MCP tools remotely (best for the workshop; §9 topology A).\n\n"
+                "**Hosted (B)** — a thin client pointing at a hosted orchestrator endpoint "
+                "(set `ORCHESTRATOR_ENDPOINT`)."
+            ),
+        )
+        if topo.startswith("Hosted"):
+            ep = os.getenv("ORCHESTRATOR_ENDPOINT")
+            if ep:
+                st.caption(f"🌐 Hosted endpoint: `{ep}`")
+            else:
+                st.warning("`ORCHESTRATOR_ENDPOINT` not set — running the **Local** orchestrator.")
+        else:
+            st.caption("🖥️ Local orchestrator — hosted agents + MCP tools remain visible in Foundry.")
+
+        st.subheader("Demo pacing")
+        pace = st.slider(
+            "Mock tool latency (ms)", 0, 3000, 600, 100,
+            help="Raise to watch the branch timers tick. Above a branch's budget it breaches (amber).",
+        )
+        st.caption(
+            f"Budgets — comms {budgets.comms_tool_ms} · labs {budgets.labs_tool_ms} · "
+            f"knowledge {budgets.knowledge_ms} · context {budgets.patient_context_ms} ms"
+        )
+
+    tools = ToolsConfig(
+        use_real_adapter=False, mock_latency_ms=pace,
+        mock_jitter_ms=min(150, pace // 4), timeout_ms=8000,
+    )
+
+    snap = cstate.snapshot()
+
+    # ── Badge simulator (input) ─────────────────────────────────────────
+    st.subheader("🎧 Badge simulator")
+    c_in, c_send, c_panic = st.columns([5, 1, 1])
+    with c_in:
+        st.text_input(
+            "Nurse utterance", key="cockpit_utterance",
+            placeholder="patient in bed 12 looks septic",
+            label_visibility="collapsed", disabled=snap.running,
+        )
+    with c_send:
+        send_clicked = st.button("▶ Send", use_container_width=True, disabled=snap.running)
+    with c_panic:
+        panic_clicked = st.button(
+            "🚨 PANIC", type="primary", use_container_width=True, disabled=snap.running,
+            help="Force urgency=EMERGENCY (hard badge override).",
+        )
+    st.caption(
+        "Try: *patient in bed 12 looks septic* (sepsis fast path) · "
+        "*find nurse Barbara in cardiology* (routine) · or hit **PANIC**."
+    )
+
+    if (send_clicked or panic_clicked) and not snap.running:
+        utt = st.session_state.get("cockpit_utterance", "")
+        if utt or panic_clicked:
+            ck.start_run(cstate, utt, panic=panic_clicked, tools=tools, budgets=budgets)
+            time.sleep(0.15)
+            st.rerun()
+
+    snap = cstate.snapshot()
+    if snap.error:
+        st.error(f"Run failed: {snap.error}")
+
+    # ── Transcript | Orchestration cockpit ──────────────────────────────
+    col_t, col_c = st.columns([2, 3])
+    with col_t:
+        _render_cockpit_transcript(snap)
+    with col_c:
+        _render_cockpit_branches(snap)
+
+    # ── Sepsis panel (when active) ──────────────────────────────────────
+    if snap.sepsis.active:
+        _render_cockpit_sepsis(snap, ck)
+
+    # ── Control Plane link ──────────────────────────────────────────────
+    st.markdown("---")
+    cp_col, sum_col = st.columns([1, 3])
+    with cp_col:
+        st.link_button(
+            "🛰️ Foundry Control Plane", ck.control_plane_url(cfg.foundry.project_endpoint),
+            use_container_width=True,
+        )
+        if snap.correlation_id:
+            st.caption(f"Filter Tracing by\n`{snap.correlation_id}`")
+    with sum_col:
+        if snap.summary:
+            st.success(snap.summary)
+        if snap.ack_latency_ms is not None:
+            st.metric("Emergency acknowledgment latency", f"{snap.ack_latency_ms:.0f} ms",
+                      help=f"Budget {budgets.spoken_ack_ms} ms — spoken before any tool runs.")
+
+    # ── Live refresh while the run streams ──────────────────────────────
+    if snap.running:
+        time.sleep(0.4)
+        st.rerun()
+
+
+def _render_cockpit_transcript(snap) -> None:
+    st.subheader("💬 Live transcript")
+    if not snap.transcript:
+        st.info("Type an utterance (or hit PANIC) to drive the front door.")
+        return
+    box = st.container(height=440)
+    with box:
+        for t in snap.transcript:
+            ts = f"<small style='color:#999'>{t.ts}</small>"
+            if t.role == "nurse":
+                st.markdown(f'<div class="nurse-line">{ts} 🧑 <b>Nurse:</b> {t.text}</div>',
+                            unsafe_allow_html=True)
+            elif t.is_ack:
+                st.markdown(f'<div class="ack-line">{ts} 🔊 <b>ACK:</b> {t.text}</div>',
+                            unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="agent-line">{ts} 🤖 {t.text}</div>',
+                            unsafe_allow_html=True)
+
+
+def _render_cockpit_branches(snap) -> None:
+    st.subheader("🧭 Orchestration cockpit")
+    if not snap.path:
+        st.info("The routing decision and concurrent branches appear here on the first run.")
+        return
+
+    badge = ('<span class="badge-fast">FAST PATH</span>' if snap.path == "fast"
+             else '<span class="badge-std">STANDARD PATH</span>')
+    st.markdown(
+        f"{badge} &nbsp; intent `{snap.intent}` · urgency **{snap.urgency}**",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"correlation_id `{snap.correlation_id}`")
+
+    if snap.branches:
+        st.markdown("**Concurrent branches** — elapsed vs latency budget")
+        for b in snap.branches:
+            elapsed = b.latency_ms if b.latency_ms is not None else b.elapsed_ms()
+            frac = min(1.0, (elapsed / b.budget_ms) if b.budget_ms else 1.0)
+            if b.status in ("queued", "running"):
+                bar = "bar-amber" if b.over_budget() else "bar-grey"
+            elif b.status == "breach":
+                bar = "bar-amber"
+            else:  # done
+                bar = "bar-amber" if b.over_budget() else "bar-green"
+            icon = {"queued": "⚪", "running": "🔵", "done": "✅",
+                    "breach": "🟠", "failed": "❌"}.get(b.status, "⚪")
+            note = " · still working…" if b.over_budget() and b.status != "done" else ""
+            esc = " ⚡first" if b.escalation else ""
+            st.markdown(
+                f'<div class="branch-row">{icon} <b>{b.name}</b>{esc} '
+                f'<small>{b.label} — {elapsed:.0f}/{int(b.budget_ms)} ms{note}</small>'
+                f'<div class="branch-bar-bg"><div class="branch-bar {bar}" '
+                f'style="width:{frac * 100:.0f}%"></div></div></div>',
+                unsafe_allow_html=True,
+            )
+
+    if snap.call_log:
+        with st.expander("🔧 Agent / tool call log", expanded=not snap.running):
+            for ts, name, detail, lat in snap.call_log:
+                lat_s = f"{lat:.0f} ms" if lat is not None else "—"
+                st.markdown(f"`{ts}` **{name}** · {detail or 'ok'} · {lat_s}")
+
+
+def _render_cockpit_sepsis(snap, ck) -> None:
+    st.markdown("---")
+    s = snap.sepsis
+    st.subheader("🩸 Sepsis hour-1 bundle")
+    if s.suspicion is False:
+        st.info("Objective screen low-risk (SIRS & qSOFA negative) — documented, no bundle launched.")
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("SIRS", s.sirs, help=", ".join(s.flags) or None)
+    m2.metric("qSOFA", s.qsofa)
+    if s.timer_started_mono is not None:
+        m3.metric("Hour-1 elapsed", _fmt_mmss(s.elapsed_s()),
+                  delta=f"-{_fmt_mmss(s.remaining_s())} left", delta_color="off")
+    else:
+        m3.metric("Hour-1 elapsed", "—")
+
+    col_chk, col_cite = st.columns([3, 2])
+    with col_chk:
+        st.markdown("**Hour-1 checklist** (human-in-the-loop)")
+        for item in ck.build_checklist(snap):
+            if item.status == "ordered":
+                mark = "✅ ordered"
+            elif item.status == "proposed":
+                mark = "🔲 proposed — clinician confirms"
+            else:
+                mark = "⏳ pending"
+            st.markdown(f"{item.order}. {item.text}  \n&nbsp;&nbsp;&nbsp;*{mark}*")
+        if s.remeasure and s.initial_lactate is not None:
+            st.warning(
+                f"Initial lactate {s.initial_lactate:g} mmol/L > 2 — re-measure due within the hour-1 window."
+            )
+    with col_cite:
+        st.markdown("**Grounding**")
+        if s.protocol_cited:
+            st.success("Protocol retrieved & cited (Foundry IQ)")
+        for sid, title, url in s.citations:
+            st.markdown(f"- [{sid}]({url}) — {title}")
+        st.caption("Treatments are prepared for a clinician to confirm — never auto-ordered; "
+                   "no alarm is suppressed or overridden.")
+
+
+# ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
@@ -530,6 +788,20 @@ def render_ui():
     .cost-warning { background: #fff9c4; padding: 12px; border-radius: 8px; border: 2px solid #fbc02d; margin: 8px 0; }
     </style>
     """, unsafe_allow_html=True)
+
+    # ── App mode: original SIRE voice agent vs the Nightingale cockpit ──
+    app_mode = st.sidebar.radio(
+        "App",
+        ["🎙️ SIRE Voice", "🏥 Nightingale Cockpit"],
+        help=(
+            "**SIRE Voice** — the original real-time voice agent (VoiceLive + AI Search).\n\n"
+            "**Nightingale Cockpit** — the latency-aware, multi-agent orchestration demo: "
+            "badge simulator, live branch timers, sepsis hour-1 checklist, Control Plane link."
+        ),
+    )
+    if app_mode == "🏥 Nightingale Cockpit":
+        _render_cockpit()
+        return
 
     # ── Header ──────────────────────────────────────────────────────────
     st.title("🎙️ SIRE Voice Agent")
