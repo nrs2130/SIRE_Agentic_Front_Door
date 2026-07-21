@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.labs_hl7")
 
@@ -229,6 +230,7 @@ def create_labs_adapter(config: ToolsConfig | None = None) -> LabsAdapter:
     return MockLabsAdapter(config)
 
 
+@traced_tool("labs_hl7")
 async def order_labs(
     patient_ref: str,
     tests: list[str],

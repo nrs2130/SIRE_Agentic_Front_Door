@@ -21,12 +21,14 @@ against https://learn.microsoft.com/agent-framework/workflows/.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from agent_framework import Workflow, WorkflowBuilder
 
 from src.gateway.intent_envelope import IntentEnvelope, Urgency
+from src.telemetry import ATTR_PREFIX, BranchTiming, RunSummary, get_tracer
 
 from .executors import (
     FastPathDispatch,
@@ -116,6 +118,12 @@ class OrchestrationResult:
     summary: str | None = None  # final spoken summary
     ack_latency_ms: float | None = None  # emergency acknowledgment latency (fast path)
     branch_latencies_ms: dict[str, float] = field(default_factory=dict)  # per-branch (fast path)
+    run_summary: "RunSummary | None" = None  # compact observability summary (docs §6)
+
+    @property
+    def run_summary_text(self) -> str:
+        """The formatted run summary (routing, branch latencies, breaches), or ''."""
+        return self.run_summary.format() if self.run_summary else ""
 
 
 class Orchestrator:
@@ -125,6 +133,10 @@ class Orchestrator:
     budgeted, speculative — docs §3.2). ROUTINE envelopes run the standard-path workflow graph.
     Either way, every intermediate spoken update is forwarded to the gateway's ``speak()`` as
     it arrives, then the final summary is spoken.
+
+    Each run is wrapped in a ``conversation`` OpenTelemetry span keyed by ``correlation_id`` so a
+    single trace spans gateway → orchestrator → agents → tools, and a compact run summary is
+    emitted at the end (docs/01-architecture.md §6, /observability).
     """
 
     def __init__(
@@ -140,13 +152,25 @@ class Orchestrator:
             branch_delay=branch_delay, branch_budget=branch_budget
         )
         self._fast_path = fast_path or FastPath(gateway)
+        self._tracer = get_tracer("nightingale.orchestrator")
 
     async def handle(self, envelope: IntentEnvelope) -> OrchestrationResult:
         """Run the emergency fast path or the standard graph, streaming spoken updates."""
         cid = envelope.correlation_id
-        if envelope.urgency is Urgency.EMERGENCY:
-            return await self._handle_fast(envelope)
-        return await self._handle_standard(envelope)
+        with self._tracer.start_as_current_span("conversation") as span:
+            span.set_attribute(f"{ATTR_PREFIX}.correlation_id", cid)
+            span.set_attribute(f"{ATTR_PREFIX}.urgency", envelope.urgency.value)
+            span.set_attribute(f"{ATTR_PREFIX}.intent", envelope.intent)
+            if envelope.urgency is Urgency.EMERGENCY:
+                result = await self._handle_fast(envelope)
+            else:
+                result = await self._handle_standard(envelope)
+            # (3) Emit the compact run summary — routing, branch latencies, breaches.
+            if result.run_summary is not None:
+                span.set_attribute(f"{ATTR_PREFIX}.budget_breaches",
+                                   ",".join(result.run_summary.breaches) or "none")
+                logger.info("run summary:\n%s", result.run_summary.format())
+            return result
 
     async def _handle_fast(self, envelope: IntentEnvelope) -> OrchestrationResult:
         """Emergency: delegate to the hardened FastPath (it streams via the gateway itself)."""
@@ -156,9 +180,19 @@ class Orchestrator:
         )
         fp = await self._fast_path.run(envelope)
         logger.info("orchestration done correlation_id=%s path=fast", cid)
+        run_summary = RunSummary(
+            correlation_id=cid, path="fast", intent=envelope.intent,
+            urgency=envelope.urgency.value, ack_latency_ms=fp.ack_latency_ms,
+            ack_budget_ms=self._fast_path.spoken_ack_budget_ms,
+            branches=[
+                BranchTiming(o.name, o.latency_ms, o.budget_ms, o.status)
+                for o in fp.outcomes
+            ],
+        )
         return OrchestrationResult(
             correlation_id=cid, path="fast", spoken=fp.spoken, summary=fp.summary,
             ack_latency_ms=fp.ack_latency_ms, branch_latencies_ms=fp.branch_latencies_ms,
+            run_summary=run_summary,
         )
 
     async def _handle_standard(self, envelope: IntentEnvelope) -> OrchestrationResult:
@@ -169,6 +203,7 @@ class Orchestrator:
             cid, envelope.urgency.value,
         )
         result = OrchestrationResult(correlation_id=cid, path="standard")
+        t0 = time.perf_counter()
         async for event in self._workflow.run(envelope, stream=True):
             etype = getattr(event, "type", None)
             if etype == "intermediate":
@@ -178,5 +213,10 @@ class Orchestrator:
             elif etype == "output":
                 result.summary = str(event.data)
                 await self._gateway.speak(result.summary)
+        total_ms = round((time.perf_counter() - t0) * 1000, 2)
+        result.run_summary = RunSummary(
+            correlation_id=cid, path="standard", intent=envelope.intent,
+            urgency=envelope.urgency.value, total_ms=total_ms,
+        )
         logger.info("orchestration done correlation_id=%s path=standard", cid)
         return result

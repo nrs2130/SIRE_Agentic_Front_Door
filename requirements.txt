@@ -28,11 +28,13 @@ azure-ai-projects==2.3.0
 mcp[cli]==1.28.1,<2
 
 # --- L5 Telemetry: OpenTelemetry + Azure Monitor (Control Plane) ------------
-# opentelemetry-sdk/api 1.44.0. https://pypi.org/project/opentelemetry-sdk/
-opentelemetry-api==1.44.0
-opentelemetry-sdk==1.44.0
-# azure-monitor-opentelemetry 1.8.9 — exports traces to the Foundry Control Plane.
-# https://pypi.org/project/azure-monitor-opentelemetry/
+# opentelemetry-sdk/api 1.43.0. https://pypi.org/project/opentelemetry-sdk/
+# NOTE: pinned to 1.43.x (NOT 1.44) — azure-monitor-opentelemetry 1.8.9 requires
+# opentelemetry-sdk~=1.43.0, so 1.44 conflicts. Verified 2026-07-21.
+opentelemetry-api==1.43.0
+opentelemetry-sdk==1.43.0
+# azure-monitor-opentelemetry 1.8.9 — exports traces to Application Insights, which the
+# Foundry Control Plane reads under its Tracing tab. https://pypi.org/project/azure-monitor-opentelemetry/
 azure-monitor-opentelemetry==1.8.9
 
 # --- Audio (SIRE_demo voice I/O) --------------------------------------------

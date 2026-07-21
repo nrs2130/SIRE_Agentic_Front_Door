@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.patient_context")
 
@@ -202,6 +203,7 @@ def create_patient_context_adapter(
     return MockPatientContextAdapter(config)
 
 
+@traced_tool("patient_context")
 async def get_patient_context(
     patient_ref: str,
     *,

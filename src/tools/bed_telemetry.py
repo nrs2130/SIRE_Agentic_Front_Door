@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.bed_telemetry")
 
@@ -194,6 +195,7 @@ def create_bed_telemetry_adapter(
     return MockBedTelemetryAdapter(config)
 
 
+@traced_tool("bed_telemetry")
 async def read_bed_telemetry(
     bed_ref: str,
     *,

@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.oncall_lookup")
 
@@ -183,6 +184,7 @@ def create_oncall_adapter(config: ToolsConfig | None = None) -> OnCallAdapter:
     return MockOnCallAdapter(config)
 
 
+@traced_tool("oncall_lookup")
 async def lookup_oncall(
     role: str,
     location: str | None = None,

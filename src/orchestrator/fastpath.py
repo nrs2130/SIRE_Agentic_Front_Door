@@ -126,6 +126,11 @@ class FastPath:
         self._tracer = tracer or get_tracer("nightingale.orchestrator.fastpath")
         self._ack_text = ack_text
 
+    @property
+    def spoken_ack_budget_ms(self) -> int:
+        """The acknowledgment latency budget (ms) this fast path holds itself to."""
+        return self._budgets.spoken_ack_ms
+
     # -- public API ----------------------------------------------------------
     async def run(self, envelope: IntentEnvelope) -> FastPathResult:
         """Run the emergency fast path for ``envelope`` and stream spoken updates."""

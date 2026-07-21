@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.monitor_alarm")
 
@@ -219,6 +220,7 @@ def create_monitor_adapter(config: ToolsConfig | None = None) -> MonitorAdapter:
     return MockMonitorAdapter(config)
 
 
+@traced_tool("monitor_alarm")
 async def read_monitor(
     monitor_ref: str,
     *,

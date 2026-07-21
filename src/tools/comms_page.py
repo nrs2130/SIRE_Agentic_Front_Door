@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.comms_page")
 
@@ -174,6 +175,7 @@ def create_comms_adapter(config: ToolsConfig | None = None) -> CommsAdapter:
     return MockCommsAdapter(config)
 
 
+@traced_tool("comms_page")
 async def send_page(
     recipient: str,
     message: str,

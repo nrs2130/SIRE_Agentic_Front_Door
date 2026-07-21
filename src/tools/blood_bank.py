@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.blood_bank")
 
@@ -241,6 +242,7 @@ def create_blood_bank_adapter(config: ToolsConfig | None = None) -> BloodBankAda
     return MockBloodBankAdapter(config)
 
 
+@traced_tool("blood_bank")
 async def check_blood_bank(
     patient_ref: str,
     *,

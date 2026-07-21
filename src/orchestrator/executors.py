@@ -20,6 +20,7 @@ from agent_framework import Executor, WorkflowContext, executor, handler
 from typing_extensions import Never
 
 from src.gateway.intent_envelope import IntentEnvelope, Urgency
+from src.telemetry import node_span
 
 from .messages import (
     BranchResult,
@@ -55,12 +56,13 @@ class RouterExecutor(Executor):
         ctx: WorkflowContext[FastPathRequest | StandardPathRequest],
     ) -> None:
         cid = envelope.correlation_id
-        if envelope.urgency is Urgency.EMERGENCY:
-            logger.info("router->FAST correlation_id=%s intent=%s", cid, envelope.intent)
-            await ctx.send_message(FastPathRequest(envelope))
-        else:
-            logger.info("router->STANDARD correlation_id=%s intent=%s", cid, envelope.intent)
-            await ctx.send_message(StandardPathRequest(envelope))
+        with node_span("router", cid, urgency=envelope.urgency.value, intent=envelope.intent):
+            if envelope.urgency is Urgency.EMERGENCY:
+                logger.info("router->FAST correlation_id=%s intent=%s", cid, envelope.intent)
+                await ctx.send_message(FastPathRequest(envelope))
+            else:
+                logger.info("router->STANDARD correlation_id=%s intent=%s", cid, envelope.intent)
+                await ctx.send_message(StandardPathRequest(envelope))
 
 
 # --- Placeholder agent (mock) ----------------------------------------------
@@ -80,25 +82,26 @@ def make_mock_agent(
     @executor(id=id)
     async def run_branch(task: BranchTask, ctx: WorkflowContext[BranchResult, str]) -> None:
         cid = task.envelope.correlation_id
-        await ctx.yield_output(f"[{name}] {action}…")
-        if delay > budget:
-            await asyncio.sleep(budget)
-            logger.info("branch PENDING name=%s correlation_id=%s", name, cid)
-            await ctx.yield_output(f"Still working on {name}…")
-            await ctx.send_message(
-                BranchResult(
-                    task.envelope,
-                    name,
-                    "pending",
-                    f"{name} exceeded {int(budget * 1000)}ms budget",
+        with node_span(f"branch.{name}", cid, branch=name, budget_ms=budget * 1000):
+            await ctx.yield_output(f"[{name}] {action}…")
+            if delay > budget:
+                await asyncio.sleep(budget)
+                logger.info("branch PENDING name=%s correlation_id=%s", name, cid)
+                await ctx.yield_output(f"Still working on {name}…")
+                await ctx.send_message(
+                    BranchResult(
+                        task.envelope,
+                        name,
+                        "pending",
+                        f"{name} exceeded {int(budget * 1000)}ms budget",
+                    )
                 )
-            )
-        else:
-            await asyncio.sleep(delay)
-            logger.info("branch DONE name=%s correlation_id=%s", name, cid)
-            await ctx.send_message(
-                BranchResult(task.envelope, name, "done", f"{name} {action} complete")
-            )
+            else:
+                await asyncio.sleep(delay)
+                logger.info("branch DONE name=%s correlation_id=%s", name, cid)
+                await ctx.send_message(
+                    BranchResult(task.envelope, name, "done", f"{name} {action} complete")
+                )
 
     return run_branch
 
@@ -145,11 +148,12 @@ class StandardEnrich(Executor):
         self, req: StandardPathRequest, ctx: WorkflowContext[BranchTask, str]
     ) -> None:
         env = req.envelope
-        await ctx.yield_output(
-            f"Looking up patient context and on-call for {env.intent.replace('_', ' ')}…"
-        )
-        logger.info("standard enrich correlation_id=%s", env.correlation_id)
-        await ctx.send_message(BranchTask(env))
+        with node_span("std_enrich", env.correlation_id, urgency=env.urgency.value):
+            await ctx.yield_output(
+                f"Looking up patient context and on-call for {env.intent.replace('_', ' ')}…"
+            )
+            logger.info("standard enrich correlation_id=%s", env.correlation_id)
+            await ctx.send_message(BranchTask(env))
 
 
 class StandardResolve(Executor):
@@ -160,11 +164,12 @@ class StandardResolve(Executor):
         self, results: list[BranchResult], ctx: WorkflowContext[StandardProgress, str]
     ) -> None:
         env = results[0].envelope
-        await ctx.yield_output("Resolving entity via SIRE…")
-        logger.info("standard resolve correlation_id=%s", env.correlation_id)
-        prog = StandardProgress(env, [r.detail for r in results])
-        prog.notes.append("SIRE resolved entity (mock)")
-        await ctx.send_message(prog)
+        with node_span("std_resolve", env.correlation_id):
+            await ctx.yield_output("Resolving entity via SIRE…")
+            logger.info("standard resolve correlation_id=%s", env.correlation_id)
+            prog = StandardProgress(env, [r.detail for r in results])
+            prog.notes.append("SIRE resolved entity (mock)")
+            await ctx.send_message(prog)
 
 
 class StandardAct(Executor):
@@ -174,10 +179,11 @@ class StandardAct(Executor):
     async def act(
         self, prog: StandardProgress, ctx: WorkflowContext[StandardProgress, str]
     ) -> None:
-        await ctx.yield_output("Placing the call…")
-        logger.info("standard act correlation_id=%s", prog.correlation_id)
-        prog.notes.append("comms placed (mock)")
-        await ctx.send_message(prog)
+        with node_span("std_act", prog.correlation_id):
+            await ctx.yield_output("Placing the call…")
+            logger.info("standard act correlation_id=%s", prog.correlation_id)
+            prog.notes.append("comms placed (mock)")
+            await ctx.send_message(prog)
 
 
 class StandardSummary(Executor):
@@ -188,9 +194,10 @@ class StandardSummary(Executor):
         self, prog: StandardProgress, ctx: WorkflowContext[Never, str]
     ) -> None:
         env = prog.envelope
-        readback = f"Confirmed: {env.intent.replace('_', ' ')}"
-        if env.entities:
-            readback += " for " + ", ".join(f"{k} {v}" for k, v in env.entities.items())
-        readback += ". " + "; ".join(prog.notes) + "."
-        logger.info("standard summary correlation_id=%s", env.correlation_id)
-        await ctx.yield_output(readback)
+        with node_span("std_summary", env.correlation_id):
+            readback = f"Confirmed: {env.intent.replace('_', ' ')}"
+            if env.entities:
+                readback += " for " + ", ".join(f"{k} {v}" for k, v in env.entities.items())
+            readback += ". " + "; ".join(prog.notes) + "."
+            logger.info("standard summary correlation_id=%s", env.correlation_id)
+            await ctx.yield_output(readback)

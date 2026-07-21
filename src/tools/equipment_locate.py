@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
+from src.telemetry import traced_tool
 
 logger = logging.getLogger("nightingale.tools.equipment_locate")
 
@@ -235,6 +236,7 @@ def create_equipment_locate_adapter(
     return MockEquipmentLocateAdapter(config)
 
 
+@traced_tool("equipment_locate")
 async def locate_equipment(
     equipment_type: str,
     *,

@@ -56,6 +56,7 @@ import pyaudio
 
 from config import AppConfig
 from search_client import SIRESearchClient
+from src.telemetry import configure_telemetry
 
 # ---------------------------------------------------------------------------
 # Change to script directory so .env is found
@@ -592,6 +593,12 @@ def main() -> None:
         logger.setLevel(logging.DEBUG)
 
     cfg = AppConfig.from_env()
+
+    # Observability: export OpenTelemetry traces to the Application Insights linked to the
+    # Foundry project (Control Plane Tracing tab). No-op if neither
+    # APPLICATIONINSIGHTS_CONNECTION_STRING nor OTEL_CONSOLE_EXPORT is set (docs §6).
+    if configure_telemetry(cfg.telemetry):
+        logger.info("telemetry export enabled (service=%s)", cfg.telemetry.service_name)
 
     # Credential
     cred: Union[AzureKeyCredential, AsyncTokenCredential]
