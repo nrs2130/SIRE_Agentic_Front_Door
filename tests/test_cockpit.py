@@ -149,15 +149,42 @@ def test_workflow_key_routes_intents() -> None:
 
 
 async def test_contact_provider_routes_to_sire_workflow() -> None:
-    """'page the on-call cardiologist' → standard path, SIRE resolve+page workflow."""
+    """'page the on-call cardiologist' → SIRE resolve+page workflow with a talk-back summary."""
     state = CockpitState()
     await run_cockpit(state, "page the on-call cardiologist", tools=_FAST_TOOLS)
     snap = state.snapshot()
     assert snap.path == "standard"
     assert snap.intent == "contact_provider"
-    assert workflow_key(snap.intent, snap.path) == "sire"
-    # The SIRE/standard path surfaces its concurrent enrich branches for the flow view.
-    assert [b.name for b in snap.branches] == ["patient_context", "oncall"]
+    assert snap.workflow == "sire"
+    # SIRE resolves a person + a group concurrently (RRF), then pages.
+    assert [b.name for b in snap.branches] == ["resolve_person", "resolve_group", "page"]
+    assert snap.sire.active is True
+    assert snap.sire.query
+    # The workflow narrates: at least a lookup line and a closing summary are spoken.
+    from src.demo.cockpit import is_spoken_line
+
+    spoken = [t.text for t in snap.transcript if t.role == "agent" and is_spoken_line(t.text)]
+    assert spoken and any("Looking up" in s for s in spoken)
+    assert snap.summary
+
+
+def test_is_spoken_line_filters_cockpit_cues() -> None:
+    """Bracketed branch cues + Status lines are shown but not spoken; the rest is spoken."""
+    from src.demo.cockpit import is_spoken_line
+
+    assert is_spoken_line("Starting the sepsis hour-1 protocol.") is True
+    assert is_spoken_line("I found Dr. Chen. Paging now.") is True
+    assert is_spoken_line("[comms] paging RRT…") is False
+    assert is_spoken_line("Status: comms ✓, orders still working…") is False
+
+
+def test_is_sire_query_routes_lookups() -> None:
+    from src.demo.cockpit import is_sire_query
+
+    assert is_sire_query("contact_provider", "page the on-call cardiologist") is True
+    assert is_sire_query("general_request", "find nurse Barbara in cardiology") is True
+    assert is_sire_query("general_request", "what time is it") is False
+    assert is_sire_query("sepsis_screen", "bed 12 looks septic") is False
 
 
 async def test_flow_dot_lights_active_workflow_only() -> None:

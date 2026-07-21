@@ -126,12 +126,39 @@ def standard_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
     ]
 
 
+def sire_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
+    """SIRE workflow branches: resolve a person + a group concurrently (RRF), then page."""
+    return [
+        BranchMeta("resolve_person", "SIRE person resolution (RRF)", budgets.patient_context_ms, "person resolved"),
+        BranchMeta("resolve_group", "SIRE group resolution (RRF)", budgets.patient_context_ms, "group resolved"),
+        BranchMeta("page", "handing page to Engage", budgets.comms_tool_ms, "paged", escalation=True),
+    ]
+
+
+# A person/group lookup that the SIRE workflow should resolve + page (docs: SIRE is one agent
+# behind the front door). ``contact_provider`` always routes here; a general request that reads
+# like a directory lookup (find / who is / page / call / on-call) does too.
+_SIRE_LOOKUP_RE = re.compile(
+    r"\b(find|who\s+is|who's|look\s*up|lookup|page|call|reach|contact|connect|on[-\s]?call)\b",
+    re.IGNORECASE,
+)
+
+
+def is_sire_query(intent: str, utterance: str) -> bool:
+    """True when the utterance should route to the SIRE resolve+page workflow."""
+    if intent == "contact_provider":
+        return True
+    if intent == "general_request" and _SIRE_LOOKUP_RE.search(utterance or ""):
+        return True
+    return False
+
+
 def workflow_key(intent: str, path: str) -> str:
     """Map (intent, path) to a workflow key for the flow visualizer."""
     if path == "fast":
         return "sepsis" if intent in SEPSIS_INTENTS else "emergency"
-    if intent in {"contact_provider", "panic_button"} or intent.startswith("contact"):
-        return "sire" if intent == "contact_provider" else "standard"
+    if is_sire_query(intent, "") or intent == "contact_provider":
+        return "sire"
     return "standard"
 
 
@@ -208,6 +235,40 @@ class SepsisView:
         return max(0.0, self.window_s - self.elapsed_s())
 
 
+@dataclass
+class SireMatch:
+    """One resolved SIRE candidate (person or group) with its aggregate RRF score."""
+
+    name: str
+    kind: str  # "person" | "group"
+    score: float
+    confident: bool
+    detail: str = ""
+
+
+@dataclass
+class SireView:
+    """Live SIRE panel: the resolve query, the top match, candidates, and the page."""
+
+    active: bool = False
+    query: str = ""
+    match: SireMatch | None = None
+    candidates: list[SireMatch] = field(default_factory=list)
+    page_id: str | None = None
+    paged_to: str = ""
+
+
+def is_spoken_line(text: str) -> bool:
+    """Whether a streamed line is natural spoken narration (vs a cockpit-only telemetry cue).
+
+    The orchestrator's ``[branch] label…`` fan-out cues and ``Status: …`` rolling lines drive
+    the visual cockpit; they'd make the voice narration robotic, so they are shown but not
+    spoken. Everything else (acknowledgment, screen result, summaries) is spoken to the nurse.
+    """
+    t = text.strip()
+    return not (t.startswith("[") or t.startswith("Status:"))
+
+
 class CockpitState:
     """Thread-safe shared state between the driver thread and the Streamlit UI."""
 
@@ -225,12 +286,14 @@ class CockpitState:
             self.intent: str = ""
             self.urgency: str = ""
             self.path: str = ""  # "fast" | "standard"
+            self.workflow: str = ""  # sepsis | emergency | sire | standard
             self.correlation_id: str = ""
             self.transcript: list[TranscriptTurn] = []
             self.branches: dict[str, BranchView] = {}
             self.branch_order: list[str] = []
             self.call_log: list[tuple[str, str, str, float | None]] = []
             self.sepsis: SepsisView = SepsisView()
+            self.sire: SireView = SireView()
             self.summary: str = ""
             self.ack_latency_ms: float | None = None
             self._breaches: set[str] = set()
@@ -254,6 +317,11 @@ class CockpitState:
         with self._lock:
             self.path = path
 
+    def set_workflow(self, workflow: str) -> None:
+        """Record which downstream workflow the router dispatched to (for the flow graph)."""
+        with self._lock:
+            self.workflow = workflow
+
     def set_branches(self, metas: list[BranchMeta]) -> None:
         with self._lock:
             self.branches = {
@@ -265,6 +333,25 @@ class CockpitState:
     def start_sepsis_panel(self) -> None:
         with self._lock:
             self.sepsis = SepsisView(active=True)
+
+    def start_sire_panel(self, query: str) -> None:
+        with self._lock:
+            self.sire = SireView(active=True, query=query)
+
+    def finalize_sire(
+        self,
+        *,
+        match: SireMatch | None,
+        candidates: list[SireMatch],
+        page_id: str | None,
+        paged_to: str,
+    ) -> None:
+        with self._lock:
+            self.sire.active = True
+            self.sire.match = match
+            self.sire.candidates = list(candidates)
+            self.sire.page_id = page_id
+            self.sire.paged_to = paged_to
 
     def finish(self, summary: str, ack_latency_ms: float | None) -> None:
         with self._lock:
@@ -383,11 +470,13 @@ class CockpitState:
                 intent=self.intent,
                 urgency=self.urgency,
                 path=self.path,
+                workflow=self.workflow,
                 correlation_id=self.correlation_id,
                 transcript=list(self.transcript),
                 branches=[replace(self.branches[n]) for n in self.branch_order],
                 call_log=list(self.call_log),
                 sepsis=replace(self.sepsis),
+                sire=replace(self.sire),
                 summary=self.summary,
                 ack_latency_ms=self.ack_latency_ms,
             )
@@ -404,11 +493,13 @@ class CockpitSnapshot:
     intent: str
     urgency: str
     path: str
+    workflow: str
     correlation_id: str
     transcript: list[TranscriptTurn]
     branches: list[BranchView]
     call_log: list[tuple[str, str, str, float | None]]
     sepsis: SepsisView
+    sire: SireView
     summary: str
     ack_latency_ms: float | None
 
@@ -484,6 +575,8 @@ async def _drive(
             await _run_sepsis(state, gateway, envelope, tools, budgets, window_s)
         elif is_emergency:
             await _run_emergency(state, gateway, envelope, tools, budgets)
+        elif is_sire_query(envelope.intent, envelope.utterance):
+            await _run_sire(state, gateway, envelope, tools, budgets)
         else:
             await _run_standard(state, gateway, envelope, tools, budgets)
     except Exception as exc:  # never let the UI thread see a raw crash
@@ -500,6 +593,7 @@ async def _run_sepsis(
     window_s: float,
 ) -> None:
     state.set_path("fast")
+    state.set_workflow("sepsis")
     state.set_branches(sepsis_branch_meta(budgets))
     state.start_sepsis_panel()
     wf = SepsisHour1Workflow(gateway, tools=tools, budgets=budgets, window_s=window_s)
@@ -529,11 +623,124 @@ async def _run_emergency(
     budgets: LatencyBudgets,
 ) -> None:
     state.set_path("fast")
+    state.set_workflow("emergency")
     state.set_branches(emergency_branch_meta(budgets))
     orch = Orchestrator(gateway, fast_path=FastPath(gateway, budgets=budgets, tools=tools))
     result = await orch.handle(envelope)
     state.finalize_branches(result.branch_latencies_ms, {})
     state.finish(result.summary or "", result.ack_latency_ms)
+
+
+async def _run_sire(
+    state: CockpitState,
+    gateway: VoiceGatewayBase,
+    envelope: IntentEnvelope,
+    tools: ToolsConfig,
+    budgets: LatencyBudgets,
+) -> None:
+    """SIRE workflow: resolve the person/group via multi-strategy RRF search, then page them.
+
+    Reuses the existing SIRE search client (``search_client.SIRESearchClient``) — the same
+    person/group resolution behind the front door — and the ``comms_page`` tool. Talks back the
+    resolved match and the page so the nurse hears what happened.
+    """
+    import time as _t  # noqa: PLC0415
+
+    from config import SearchConfig  # noqa: PLC0415
+    from search_client import SIRESearchClient  # noqa: PLC0415
+    from src.tools.comms_page import send_page  # noqa: PLC0415
+
+    state.set_path("standard")
+    state.set_workflow("sire")
+    state.set_branches(sire_branch_meta(budgets))
+    cid = envelope.correlation_id
+    query = (
+        envelope.entities.get("role")
+        or envelope.entities.get("name")
+        or envelope.utterance
+        or "the requested contact"
+    )
+    state.start_sire_panel(query)
+    await gateway.speak(f"Looking up {query} in the directory.")
+
+    # Fan out the two SIRE indexes concurrently (multi-strategy RRF person + group resolution).
+    state._mark_running("resolve_person")  # noqa: SLF001 - internal, same module
+    state._mark_running("resolve_group")   # noqa: SLF001
+    latencies: dict[str, float] = {}
+    candidates: list[SireMatch] = []
+    try:
+        client = SIRESearchClient(SearchConfig.from_env())
+        p0 = _t.perf_counter()
+
+        async def _people() -> list[dict]:
+            return await client.search_user(query, top=3)
+
+        async def _groups() -> list[dict]:
+            return await client.search_group(query, top=3)
+
+        people, groups = await asyncio.gather(_people(), _groups(), return_exceptions=True)
+        latencies["resolve_person"] = latencies["resolve_group"] = round(
+            (_t.perf_counter() - p0) * 1000, 1
+        )
+        candidates = _sire_candidates(people, groups)
+    except Exception as exc:  # network / search failure — degrade, still narrate
+        logger.warning("SIRE resolve failed correlation_id=%s error=%s", cid, exc)
+        latencies.setdefault("resolve_person", 0.0)
+        latencies.setdefault("resolve_group", 0.0)
+
+    match = candidates[0] if candidates else None
+    page_id: str | None = None
+    paged_to = ""
+    if match is not None:
+        conf = "" if match.confident else " (please confirm — low confidence)"
+        await gateway.speak(f"I found {match.name}{conf}. Handing a page to Engage now.")
+        state._mark_running("page")  # noqa: SLF001
+        pg0 = _t.perf_counter()
+        receipt = await send_page(
+            match.name, f"{envelope.utterance or 'Please respond'} — requested via Nightingale",
+            priority="urgent", correlation_id=cid, config=tools,
+        )
+        latencies["page"] = round((_t.perf_counter() - pg0) * 1000, 1)
+        if receipt and not receipt.error and receipt.delivery_state != "failed":
+            page_id, paged_to = receipt.page_id or None, match.name
+            summary = f"Paged {match.name}. They'll acknowledge on the badge."
+        else:
+            summary = f"Resolved {match.name}, but the page didn't go through — please retry."
+    else:
+        latencies["page"] = 0.0
+        summary = f"I couldn't confidently resolve {query} in the directory. Please refine the name."
+
+    state.finalize_branches(latencies, {})
+    state.finalize_sire(
+        match=match, candidates=candidates, page_id=page_id, paged_to=paged_to
+    )
+    await gateway.speak(summary)
+    state.finish(summary, None)
+
+
+def _sire_candidates(people, groups) -> list[SireMatch]:
+    """Merge person + group RRF results into a single scored candidate list (best first)."""
+    out: list[SireMatch] = []
+    if isinstance(people, list):
+        for r in people:
+            name = " ".join(
+                str(r.get(f, "")).strip() for f in ("FirstName", "LastName")
+            ).strip() or str(r.get("FullName", "") or r.get("id", ""))
+            if name:
+                out.append(SireMatch(
+                    name=name, kind="person", score=round(float(r.get("_match_score", 0)), 1),
+                    confident=bool(r.get("_confident")), detail=r.get("_match_strategies", ""),
+                ))
+    if isinstance(groups, list):
+        for r in groups:
+            name = str(r.get("GroupName", "") or "").strip()
+            if name:
+                out.append(SireMatch(
+                    name=name, kind="group", score=round(float(r.get("_match_score", 0)), 1),
+                    confident=bool(r.get("_confident")), detail=r.get("_match_strategies", ""),
+                ))
+    out.sort(key=lambda m: m.score, reverse=True)
+    return out[:5]
 
 
 async def _run_standard(
@@ -544,6 +751,7 @@ async def _run_standard(
     budgets: LatencyBudgets,
 ) -> None:
     state.set_path("standard")
+    state.set_workflow("standard")
     state.set_branches(standard_branch_meta(budgets))
     orch = Orchestrator(gateway, fast_path=FastPath(gateway, budgets=budgets, tools=tools))
     result = await orch.handle(envelope)
@@ -602,7 +810,7 @@ def flow_dot(snapshot: CockpitSnapshot) -> str:
     Answers 'what flow is happening for this query' at a glance.
     """
     started = bool(snapshot.path) or bool(snapshot.transcript)
-    active = workflow_key(snapshot.intent, snapshot.path) if snapshot.path else None
+    active = snapshot.workflow or (workflow_key(snapshot.intent, snapshot.path) if snapshot.path else None)
     running = snapshot.running
 
     badge_s = "done" if started else "idle"
@@ -678,16 +886,19 @@ def start_run(
 
 
 class _VoiceCockpitGateway(VoiceGatewayBase):
-    """Bridges the live Voice Live gateway's spoken channel into a :class:`CockpitState`.
+    """Mirrors the live gateway's spoken lines into a :class:`CockpitState` (transcript).
 
-    Subclassing the real gateway would pull in audio deps at import; instead we compose:
-    the Voice Live gateway (built lazily in the session) emits envelopes, and its
-    ``speak`` is redirected here so orchestrator progress lands in the cockpit.
+    Composition, not subclassing (subclassing the real gateway would pull audio deps at
+    import). The Voice Live gateway renders audio itself; we only mirror the text so the
+    cockpit transcript + branch state stay in sync with what the nurse hears.
     """
 
     def __init__(self, state: CockpitState) -> None:
         super().__init__(None)
         self._state = state
+
+    def speak_to_state(self, text: str) -> None:
+        self._state.speak(text)
 
     async def speak(self, text: str) -> None:
         self._state.speak(text)
@@ -722,8 +933,21 @@ async def run_voice_cockpit(
 
         async with AzureCliCredential() as credential:
             gateway = VoiceLiveGateway(cfg, credential)
-            # Redirect the live gateway's spoken channel into the cockpit bridge.
-            gateway.speak = bridge.speak  # type: ignore[method-assign]
+            # WRAP (don't replace) the gateway's spoken channel: keep its Voice Live audio
+            # rendering (the nurse HEARS the response) AND mirror each line into the cockpit
+            # transcript. The chattiest cockpit-only cues ([branch]…, Status:…) are shown but
+            # not spoken, so the spoken narration stays natural.
+            real_speak = gateway.speak
+
+            async def speak_and_mirror(text: str) -> None:
+                bridge.speak_to_state(text)
+                if is_spoken_line(text):
+                    try:
+                        await real_speak(text)
+                    except Exception:  # pragma: no cover - live SDK/audio hiccup
+                        logger.exception("voice talk-back speak failed")
+
+            gateway.speak = speak_and_mirror  # type: ignore[method-assign]
 
             async def _consume() -> None:
                 async for env in gateway.envelopes():

@@ -673,6 +673,10 @@ def _render_cockpit() -> None:
     if snap.sepsis.active:
         _render_cockpit_sepsis(snap, ck)
 
+    # ── SIRE panel (when active) ────────────────────────────────────────
+    if snap.sire.active:
+        _render_cockpit_sire(snap)
+
     # ── Control Plane link ──────────────────────────────────────────────
     st.markdown("---")
     cp_col, sum_col = st.columns([1, 3])
@@ -800,6 +804,34 @@ def _render_cockpit_sepsis(snap, ck) -> None:
             st.markdown(f"- [{sid}]({url}) — {title}")
         st.caption("Treatments are prepared for a clinician to confirm — never auto-ordered; "
                    "no alarm is suppressed or overridden.")
+
+
+def _render_cockpit_sire(snap) -> None:
+    st.markdown("---")
+    s = snap.sire
+    st.subheader("🔎 SIRE — person / group resolution")
+    st.caption(
+        f"Multi-strategy RRF resolution for **{s.query}** across the user + group indexes "
+        "(the SIRE agent behind the front door), then a page handed to Engage."
+    )
+    col_match, col_cand = st.columns([2, 3])
+    with col_match:
+        if s.match is not None:
+            conf = "✅ confident" if s.match.confident else "⚠️ low confidence — confirm"
+            st.metric(f"Top match ({s.match.kind})", s.match.name, help=s.match.detail or None)
+            st.caption(f"score {s.match.score:.0f} · {conf}")
+            if s.page_id:
+                st.success(f"Paged **{s.paged_to}** via Engage · `{s.page_id}`")
+            else:
+                st.warning("Resolved, but no page was sent — clinician to retry.")
+        else:
+            st.info("No confident match — please refine the name.")
+    with col_cand:
+        st.markdown("**Candidates** (RRF-ranked)")
+        for c in s.candidates:
+            star = "⭐ " if (s.match and c.name == s.match.name) else ""
+            st.markdown(f"{star}`{c.score:>5.0f}` · **{c.name}** · _{c.kind}_")
+        st.caption("Paging augments Vocera Engage's routing — a human still acknowledges and acts.")
 
 
 # ---------------------------------------------------------------------------
