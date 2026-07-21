@@ -117,12 +117,14 @@ class FastPath:
         tools: ToolsConfig | None = None,
         branches: Callable[[IntentEnvelope], list[BranchSpec]] | None = None,
         tracer: "trace.Tracer | None" = None,
+        ack_text: str | None = None,
     ) -> None:
         self._gateway = gateway
         self._budgets = budgets or LatencyBudgets.from_env()
         self._tools = tools or ToolsConfig.from_env()
         self._branch_factory = branches or self._default_branches
         self._tracer = tracer or get_tracer("nightingale.orchestrator.fastpath")
+        self._ack_text = ack_text
 
     # -- public API ----------------------------------------------------------
     async def run(self, envelope: IntentEnvelope) -> FastPathResult:
@@ -228,6 +230,8 @@ class FastPath:
         await self._gateway.speak(text)
 
     def _ack(self, envelope: IntentEnvelope) -> str:
+        if self._ack_text:
+            return self._ack_text
         return (
             f"Starting {envelope.intent.replace('_', ' ')} now — "
             "acknowledging and paging the team."
