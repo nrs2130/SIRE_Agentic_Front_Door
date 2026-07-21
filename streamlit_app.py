@@ -827,10 +827,27 @@ def _render_cockpit_sire(snap) -> None:
             st.info("No confident match — please refine the name.")
     with col_cand:
         st.markdown("**Candidates** (RRF-ranked)")
-        for c in s.candidates:
-            star = "⭐ " if (s.match and c.name == s.match.name) else ""
-            st.markdown(f"{star}`{c.score:>5.0f}` · **{c.name}** · _{c.kind}_")
-        st.caption("Paging augments Vocera Engage's routing — a human still acknowledges and acts.")
+        people = [c for c in s.candidates if c.kind == "person"]
+        groups = [c for c in s.candidates if c.kind == "group"]
+        pc, gc = st.columns(2)
+        with pc:
+            st.caption("👤 People (user index)")
+            if people:
+                for c in people:
+                    star = "⭐ " if (s.match and c.name == s.match.name) else ""
+                    st.markdown(f"{star}`{c.score:>5.0f}` · **{c.name}**")
+            else:
+                st.caption("_no user match_")
+        with gc:
+            st.caption("👥 Groups (group index)")
+            if groups:
+                for c in groups:
+                    star = "⭐ " if (s.match and c.name == s.match.name) else ""
+                    st.markdown(f"{star}`{c.score:>5.0f}` · **{c.name}**")
+            else:
+                st.caption("_no group match_")
+        st.caption("Both the user and group indexes are searched (multi-strategy RRF). "
+                   "Paging augments Vocera Engage's routing — a human still acknowledges and acts.")
 
 
 # ---------------------------------------------------------------------------

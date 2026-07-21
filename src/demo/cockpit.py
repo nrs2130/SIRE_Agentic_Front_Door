@@ -158,6 +158,18 @@ def is_sire_query(intent: str, utterance: str) -> bool:
     return False
 
 
+# Role / team words — when the request names a role or team (not a person's name) the SIRE
+# agent should prefer a GROUP match (e.g. "trauma nurse" → the "OR Trauma Nurse" group), even
+# if a same-scored person exists. A bare personal name resolves to a person.
+_ROLE_TEAM_RE = re.compile(
+    r"\b(nurse|charge|on[-\s]?call|team|pharmacist|therapist|respiratory|tech|technician|aide|"
+    r"rrt|rapid\s+response|unit|department|dept|ward|floor|station|group|service|"
+    r"icu|picu|nicu|ccu|pacu|\ber\b|\bed\b|\bor\b|trauma|code|resident|attending|hospitalist|"
+    r"intensivist|surgeon|anesthes|cardiolog|neurolog|radiolog)\b",
+    re.IGNORECASE,
+)
+
+
 def workflow_key(intent: str, path: str) -> str:
     """Map (intent, path) to a workflow key for the flow visualizer."""
     if path == "fast":
@@ -659,10 +671,12 @@ async def _run_sire(
     state.set_workflow("sire")
     state.set_branches(sire_branch_meta(budgets))
     cid = envelope.correlation_id
+    # The cleaned utterance preserves qualifiers ("PICU", "trauma", "on-call") that the coarse
+    # role-entity extraction drops, so it resolves the specific team/person better.
     query = (
-        envelope.entities.get("role")
+        _clean_sire_query(envelope.utterance)
+        or envelope.entities.get("role")
         or envelope.entities.get("name")
-        or envelope.utterance
         or "the requested contact"
     )
     state.start_sire_panel(query)
@@ -693,12 +707,10 @@ async def _run_sire(
         latencies.setdefault("resolve_person", 0.0)
         latencies.setdefault("resolve_group", 0.0)
 
-    match = candidates[0] if candidates else None
+    match = _pick_sire_match(query, candidates)
     page_id: str | None = None
     paged_to = ""
     if match is not None:
-        conf = "" if match.confident else " (please confirm — low confidence)"
-        await gateway.speak(f"I found {match.name}{conf}. Handing a page to Engage now.")
         state._mark_running("page")  # noqa: SLF001
         pg0 = _t.perf_counter()
         receipt = await send_page(
@@ -706,14 +718,16 @@ async def _run_sire(
             priority="urgent", correlation_id=cid, config=tools,
         )
         latencies["page"] = round((_t.perf_counter() - pg0) * 1000, 1)
+        kind = "team" if match.kind == "group" else "provider"
+        conf = "" if match.confident else " — please confirm"
         if receipt and not receipt.error and receipt.delivery_state != "failed":
             page_id, paged_to = receipt.page_id or None, match.name
-            summary = f"Paged {match.name}. They'll acknowledge on the badge."
+            summary = f"Found the {kind} {match.name}{conf}, and paged them via Engage. They'll acknowledge on the badge."
         else:
             summary = f"Resolved {match.name}, but the page didn't go through — please retry."
     else:
         latencies["page"] = 0.0
-        summary = f"I couldn't confidently resolve {query} in the directory. Please refine the name."
+        summary = f"I couldn't confidently resolve {query} in the directory. Please refine the request."
 
     state.finalize_branches(latencies, {})
     state.finalize_sire(
@@ -724,28 +738,80 @@ async def _run_sire(
 
 
 def _sire_candidates(people, groups) -> list[SireMatch]:
-    """Merge person + group RRF results into a single scored candidate list (best first)."""
-    out: list[SireMatch] = []
-    if isinstance(people, list):
-        for r in people:
-            name = " ".join(
-                str(r.get(f, "")).strip() for f in ("FirstName", "LastName")
-            ).strip() or str(r.get("FullName", "") or r.get("id", ""))
-            if name:
-                out.append(SireMatch(
-                    name=name, kind="person", score=round(float(r.get("_match_score", 0)), 1),
-                    confident=bool(r.get("_confident")), detail=r.get("_match_strategies", ""),
-                ))
-    if isinstance(groups, list):
-        for r in groups:
-            name = str(r.get("GroupName", "") or "").strip()
-            if name:
-                out.append(SireMatch(
-                    name=name, kind="group", score=round(float(r.get("_match_score", 0)), 1),
-                    confident=bool(r.get("_confident")), detail=r.get("_match_strategies", ""),
-                ))
-    out.sort(key=lambda m: m.score, reverse=True)
-    return out[:5]
+    """Merge person + group RRF results into a scored candidate list (best first).
+
+    Person and group scores each normalize to their OWN 0-100 scale (independent searches),
+    so they aren't directly comparable. To keep the group index visible in the panel — not
+    crowded out by same-scored people — we keep the top few of EACH kind, then order by score
+    (people win exact ties only as a tiebreak). Both indexes are always searched + surfaced.
+    """
+    def _people_matches() -> list[SireMatch]:
+        out: list[SireMatch] = []
+        if isinstance(people, list):
+            for r in people:
+                name = " ".join(
+                    str(r.get(f, "")).strip() for f in ("FirstName", "LastName")
+                ).strip() or str(r.get("FullName", "") or r.get("id", ""))
+                if name:
+                    out.append(SireMatch(
+                        name=name, kind="person", score=round(float(r.get("_match_score", 0)), 1),
+                        confident=bool(r.get("_confident")), detail=r.get("_match_strategies", ""),
+                    ))
+        return out[:3]
+
+    def _group_matches() -> list[SireMatch]:
+        out: list[SireMatch] = []
+        if isinstance(groups, list):
+            for r in groups:
+                name = str(r.get("GroupName", "") or "").strip()
+                if name:
+                    out.append(SireMatch(
+                        name=name, kind="group", score=round(float(r.get("_match_score", 0)), 1),
+                        confident=bool(r.get("_confident")), detail=r.get("_match_strategies", ""),
+                    ))
+        return out[:3]
+
+    merged = _people_matches() + _group_matches()
+    # Stable sort by score desc; person-before-group only breaks exact ties.
+    merged.sort(key=lambda m: m.score, reverse=True)
+    return merged[:6]
+
+
+# Command verbs / filler stripped from an utterance before the SIRE directory search, so the
+# query is the person/role ("trauma nurse") not the command ("page the trauma nurse" — which
+# would spuriously match a person literally named "Page").
+_SIRE_STRIP_RE = re.compile(
+    r"\b(page|contact|reach|connect|find|locate|look\s*up|lookup|get|dial|"
+    r"who\s+is|who's|for\s+me|please|can\s+you|could\s+you|i\s+need|need\s+to|"
+    r"the|a|an|to|my)\b"
+    r"|(?<!on[-\s])\bcall\b",  # strip the verb "call" but keep "on-call" / "on call"
+    re.IGNORECASE,
+)
+
+
+def _clean_sire_query(text: str) -> str:
+    """Strip command verbs + filler so the directory search sees the person/role only."""
+    cleaned = _SIRE_STRIP_RE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or (text or "").strip()
+
+
+def _pick_sire_match(query: str, candidates: list[SireMatch]) -> SireMatch | None:
+    """Choose which candidate to page: a GROUP for role/team requests, else the top score.
+
+    Person and group scores are on separate scales, so a same-scored person would otherwise
+    always win the tie. Prefer the top group only when the request is role/team-like AND that
+    group is a *confident* RRF match (a clear winner over #2) — e.g. "trauma nurse" resolves to
+    the confident "OR Trauma Nurse" team, while "nurse Barbara" (no confident group) resolves to
+    the person Barbara. A bare personal name has no group and resolves to a person.
+    """
+    if not candidates:
+        return None
+    groups = [c for c in candidates if c.kind == "group"]
+    role_like = bool(_ROLE_TEAM_RE.search(query or ""))
+    if role_like and groups and groups[0].confident:
+        return groups[0]
+    return candidates[0]  # highest score overall (person wins exact ties for names)
 
 
 async def _run_standard(
