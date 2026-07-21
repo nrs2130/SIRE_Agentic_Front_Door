@@ -614,9 +614,8 @@ def _render_cockpit() -> None:
         time.sleep(0.3)
         st.rerun()
     if stop_clicked:
-        ev = st.session_state.get("cockpit_voice_stop")
-        if ev is not None:
-            ev.set()
+        ck.stop_voice_session()
+        st.session_state.pop("cockpit_voice_stop", None)
         time.sleep(0.3)
         st.rerun()
 

@@ -54,6 +54,11 @@ _HOUR1_WINDOW_S = 3600.0
 _REALISTIC_BASE_MS = 400
 _REALISTIC_JITTER_MS = 450
 
+# Singleton guard for the live voice front door: only ONE Voice Live mic session may run at
+# a time (see start_voice_session). Two sessions would double-hear every utterance.
+_VOICE_SESSION_LOCK = threading.Lock()
+_ACTIVE_VOICE_SESSION: dict[str, object | None] = {"thread": None, "stop": None}
+
 
 def realistic_tools() -> ToolsConfig:
     """Mock tools with a realistic, fixed latency profile (models real downstream systems)."""
@@ -979,7 +984,15 @@ def start_voice_session(
     tools: ToolsConfig | None = None,
     budgets: LatencyBudgets | None = None,
 ) -> tuple[threading.Thread, threading.Event]:
-    """Spawn a daemon thread running the Voice Live front door; returns (thread, stop_event)."""
+    """Spawn a daemon thread running the Voice Live front door; returns (thread, stop_event).
+
+    Singleton: any previously started session is signaled to stop and joined first, so a
+    second 'Start listening' (or a browser refresh that re-runs the app) can never leave two
+    live mic sessions open — that would make the front door hear each utterance twice and two
+    voices talk back over each other.
+    """
+    stop_voice_session()  # tear down any prior session before starting a new one
+
     stop_event = threading.Event()
 
     def _target() -> None:
@@ -992,4 +1005,20 @@ def start_voice_session(
 
     thread = threading.Thread(target=_target, name="cockpit-voice", daemon=True)
     thread.start()
+    with _VOICE_SESSION_LOCK:
+        _ACTIVE_VOICE_SESSION["thread"] = thread
+        _ACTIVE_VOICE_SESSION["stop"] = stop_event
     return thread, stop_event
+
+
+def stop_voice_session() -> None:
+    """Signal the active voice session (if any) to stop and wait briefly for it to exit."""
+    with _VOICE_SESSION_LOCK:
+        thread = _ACTIVE_VOICE_SESSION.get("thread")
+        stop = _ACTIVE_VOICE_SESSION.get("stop")
+        _ACTIVE_VOICE_SESSION["thread"] = None
+        _ACTIVE_VOICE_SESSION["stop"] = None
+    if stop is not None:
+        stop.set()
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=5.0)

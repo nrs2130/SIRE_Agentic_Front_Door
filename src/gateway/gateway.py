@@ -181,6 +181,11 @@ class VoiceLiveGateway(VoiceGatewayBase):
         self._active_response = False
         self._response_done = False
         self._last_utterance = ""
+        # Serialize spoken talk-back so successive updates don't render overlapping
+        # Voice Live responses (which sound like two voices talking over each other).
+        self._speak_lock = asyncio.Lock()
+        self._response_complete = asyncio.Event()
+        self._response_complete.set()
         # Function-call argument accumulation for route_intent.
         self._fn_call_id: str | None = None
         self._fn_call_name: str | None = None
@@ -264,13 +269,18 @@ class VoiceLiveGateway(VoiceGatewayBase):
                     await conn.response.cancel()
                 except Exception:  # pragma: no cover - benign "no active response"
                     pass
+            # Unblock any speak() waiting on the (now-canceled) response.
+            self._active_response = False
+            self._response_complete.set()
 
         elif etype == ServerEventType.RESPONSE_CREATED:
             self._active_response, self._response_done = True, False
+            self._response_complete.clear()
         elif etype == ServerEventType.RESPONSE_AUDIO_DELTA:
             audio.enqueue(event.delta)
         elif etype == ServerEventType.RESPONSE_DONE:
             self._active_response, self._response_done = False, True
+            self._response_complete.set()
 
         # Capture the verbatim utterance for the envelope.
         elif str(etype) == "conversation.item.input_audio_transcription.completed":
@@ -334,24 +344,36 @@ class VoiceLiveGateway(VoiceGatewayBase):
         Inserts an assistant message and asks the service to render it to audio.
         Barge-in still works because a new user turn cancels the active response
         in :meth:`_on_event`.
+
+        Serialized: each call waits for the previous spoken response to finish before
+        starting the next, so streamed updates never render overlapping audio (which
+        sounds like two voices). A soft timeout keeps a stuck response from blocking.
         """
         conn = self._conn
         if conn is None:
             logger.warning("speak() called before the Voice Live session connected")
             return
-        try:
-            # OutputTextContentPart is part of azure-ai-voicelive 1.2.0; the
-            # assistant message item shape is guarded in case the symbol moves.
-            from azure.ai.voicelive.models import (  # noqa: PLC0415
-                AssistantMessageItem,
-                OutputTextContentPart,
-            )
+        async with self._speak_lock:
+            # Wait for any in-flight response to finish rendering before the next.
+            try:
+                await asyncio.wait_for(self._response_complete.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("prior spoken response did not complete in time; proceeding")
+            try:
+                # OutputTextContentPart is part of azure-ai-voicelive 1.2.0; the
+                # assistant message item shape is guarded in case the symbol moves.
+                from azure.ai.voicelive.models import (  # noqa: PLC0415
+                    AssistantMessageItem,
+                    OutputTextContentPart,
+                )
 
-            await conn.conversation.item.create(
-                item=AssistantMessageItem(content=[OutputTextContentPart(text=text)])
-            )
-            await conn.response.create()
-        except Exception:  # pragma: no cover - depends on the live SDK/runtime
-            # TODO: verify assistant-message API against
-            # https://learn.microsoft.com/azure/ai-services/speech-service/voice-live-how-to
-            logger.exception("speak() failed; verify Voice Live assistant-message API")
+                self._response_complete.clear()
+                await conn.conversation.item.create(
+                    item=AssistantMessageItem(content=[OutputTextContentPart(text=text)])
+                )
+                await conn.response.create()
+            except Exception:  # pragma: no cover - depends on the live SDK/runtime
+                # TODO: verify assistant-message API against
+                # https://learn.microsoft.com/azure/ai-services/speech-service/voice-live-how-to
+                self._response_complete.set()  # don't deadlock the next speak()
+                logger.exception("speak() failed; verify Voice Live assistant-message API")
