@@ -46,7 +46,7 @@ async def test_grounds_pages_and_orders_screen_labs() -> None:
 
     assert isinstance(result, SepsisAgentResult)
     assert result.grounded is True
-    assert result.citations and result.citations[0].source_id == "SSC-HR1-2021"
+    assert result.citations and result.citations[0].source_id == "SSC-HR1-2018"
     assert result.page_id is not None  # RRT paged (augments Engage)
     assert result.lab_order_id is not None  # lactate + cultures ordered
     # Diagnostics ordered; treatment steps proposed, awaiting a clinician.

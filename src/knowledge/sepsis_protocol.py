@@ -30,6 +30,8 @@ from typing import Protocol, runtime_checkable
 
 from config import ToolsConfig
 
+from .protocol_documents import HOUR1_ELEMENTS, SIRS_QSOFA_BCEHS, SSC_HOUR1_2018
+
 logger = logging.getLogger("nightingale.knowledge.sepsis")
 
 KNOWLEDGE_TOOL = "knowledge_base_retrieve"  # the MCP tool a Foundry IQ KB exposes
@@ -87,32 +89,35 @@ class SepsisKnowledgeProvider(Protocol):
         ...
 
 
-# --- Canonical hour-1 bundle content (synthetic snippets, real guidance shape) ---
+# --- Canonical hour-1 bundle content, sourced from the KB seed corpus ---------
+# Built from src/knowledge/protocol_documents.py so the local mock provider and the Azure AI
+# Search index (the production Foundry IQ KB) cite identical content (SSC-HR1-2018; see the
+# clinical-accuracy note there — # TODO: confirm against SSC 2021).
 _SSC = ProtocolCitation(
-    source_id="SSC-HR1-2021",
-    title="Surviving Sepsis Campaign: Hour-1 Bundle (2021)",
+    source_id=SSC_HOUR1_2018.source_id,
+    title=SSC_HOUR1_2018.title,
     snippet=(
-        "Initiate the following elements within the first hour of sepsis/septic shock "
-        "recognition: measure lactate; obtain blood cultures before antibiotics; give "
-        "broad-spectrum antibiotics; begin rapid 30 mL/kg crystalloid for hypotension or "
-        "lactate >=4 mmol/L; apply vasopressors for persistent hypotension to keep MAP >=65."
+        "Begin the hour-1 bundle immediately on recognition: measure lactate; obtain blood "
+        "cultures before antibiotics; give broad-spectrum antibiotics; begin rapid 30 mL/kg "
+        "crystalloid for hypotension or lactate >=4 mmol/L; apply vasopressors for persistent "
+        "hypotension to keep MAP >=65 mmHg."
     ),
+    url=SSC_HOUR1_2018.url,
 )
 _QSOFA = ProtocolCitation(
-    source_id="QSOFA-2016",
-    title="qSOFA bedside screening criteria (Sepsis-3, 2016)",
+    source_id=SIRS_QSOFA_BCEHS.source_id,
+    title=SIRS_QSOFA_BCEHS.title,
     snippet=(
         "Suspect sepsis with >=2 of: respiratory rate >=22/min, systolic BP <=100 mmHg, "
-        "altered mentation. A positive qSOFA warrants escalation and clinician assessment."
+        "altered mentation (qSOFA); or SIRS >=2 plus suspected/known new infection. A positive "
+        "screen warrants escalation and clinician assessment."
     ),
+    url=SIRS_QSOFA_BCEHS.url,
 )
 
-_HOUR1_STEPS: tuple[ProtocolStep, ...] = (
-    ProtocolStep(1, "diagnostic", "Measure serum lactate; remeasure if initial lactate >2 mmol/L.", "SSC-HR1-2021"),
-    ProtocolStep(2, "diagnostic", "Obtain blood cultures before administering antibiotics.", "SSC-HR1-2021"),
-    ProtocolStep(3, "treatment", "Administer broad-spectrum antibiotics.", "SSC-HR1-2021"),
-    ProtocolStep(4, "treatment", "Begin rapid 30 mL/kg IV crystalloid for hypotension or lactate >=4 mmol/L.", "SSC-HR1-2021"),
-    ProtocolStep(5, "treatment", "Apply vasopressors if hypotensive during/after fluids to maintain MAP >=65 mmHg.", "SSC-HR1-2021"),
+_HOUR1_STEPS: tuple[ProtocolStep, ...] = tuple(
+    ProtocolStep(order, category, text, SSC_HOUR1_2018.source_id)
+    for order, category, text in HOUR1_ELEMENTS
 )
 
 

@@ -302,7 +302,7 @@ def sepsis_hosted_agent_spec() -> HostedAgentSpec:
     ctx_url = os.getenv("MCP_PATIENT_CONTEXT_URL", "https://<host>/mcp/patient_context")
     kb_url = os.getenv(
         "FOUNDRY_IQ_KB_MCP_URL",
-        "https://<search>.search.windows.net/knowledgebases/<kb>/mcp?api-version=2026-05-01-preview",
+        "https://<search>.search.windows.net/knowledgebases/sepsis-protocols-kb/mcp?api-version=2026-05-01-preview",
     )
     kb_connection = os.getenv("FOUNDRY_IQ_KB_CONNECTION", "nightingale-sepsis-kb-connection")
     return HostedAgentSpec(
