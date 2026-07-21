@@ -536,7 +536,7 @@ def _fmt_mmss(seconds: float) -> str:
 
 def _render_cockpit() -> None:
     """Render the Nightingale badge simulator + orchestration cockpit."""
-    from config import AppConfig, ToolsConfig  # noqa: PLC0415
+    from config import AppConfig  # noqa: PLC0415
     from src.demo import cockpit as ck  # noqa: PLC0415  (lazy: keeps SIRE path independent)
 
     st.markdown(_COCKPIT_CSS, unsafe_allow_html=True)
@@ -573,45 +573,77 @@ def _render_cockpit() -> None:
         else:
             st.caption("🖥️ Local orchestrator — hosted agents + MCP tools remain visible in Foundry.")
 
-        st.subheader("Demo pacing")
-        pace = st.slider(
-            "Mock tool latency (ms)", 0, 3000, 600, 100,
-            help="Raise to watch the branch timers tick. Above a branch's budget it breaches (amber).",
+        st.subheader("Downstream latency")
+        st.caption(
+            "Mock adapters model real downstream round-trips — a Vocera Engage page, an HL7 "
+            "lab order, an EHR read — so the parallel fan-out is shown honestly (no slowdown dial)."
         )
         st.caption(
             f"Budgets — comms {budgets.comms_tool_ms} · labs {budgets.labs_tool_ms} · "
             f"knowledge {budgets.knowledge_ms} · context {budgets.patient_context_ms} ms"
         )
 
-    tools = ToolsConfig(
-        use_real_adapter=False, mock_latency_ms=pace,
-        mock_jitter_ms=min(150, pace // 4), timeout_ms=8000,
-    )
+    tools = ck.realistic_tools()
 
     snap = cstate.snapshot()
 
-    # ── Badge simulator (input) ─────────────────────────────────────────
-    st.subheader("🎧 Badge simulator")
-    c_in, c_send, c_panic = st.columns([5, 1, 1])
-    with c_in:
-        st.text_input(
-            "Nurse utterance", key="cockpit_utterance",
-            placeholder="patient in bed 12 looks septic",
-            label_visibility="collapsed", disabled=snap.running,
+    # ── Badge simulator (input): VOICE is the front door; text is a fallback ────
+    st.subheader("🎧 Badge — the voice front door")
+    v_start, v_stop, v_status = st.columns([1, 1, 4])
+    with v_start:
+        listen_clicked = st.button(
+            "🎙️ Start listening", use_container_width=True,
+            disabled=snap.listening or snap.running,
+            help="Open a live Azure Voice Live session (gpt-realtime). Speak a request; the "
+                 "front door classifies intent + urgency and routes to the right workflow.",
         )
-    with c_send:
-        send_clicked = st.button("▶ Send", use_container_width=True, disabled=snap.running)
-    with c_panic:
-        panic_clicked = st.button(
-            "🚨 PANIC", type="primary", use_container_width=True, disabled=snap.running,
-            help="Force urgency=EMERGENCY (hard badge override).",
+    with v_stop:
+        stop_clicked = st.button(
+            "⏹ Stop", use_container_width=True, disabled=not snap.listening,
         )
-    st.caption(
-        "Try: *patient in bed 12 looks septic* (sepsis fast path) · "
-        "*find nurse Barbara in cardiology* (routine) · or hit **PANIC**."
-    )
+    with v_status:
+        if snap.listening:
+            st.success("🔴 Listening — speak into the badge. "
+                       "Try “page the on-call cardiologist” or “patient in bed 12 looks septic”.")
+        else:
+            st.caption("Mic idle. Start listening, or use the text fallback below (mic-less / CI).")
 
-    if (send_clicked or panic_clicked) and not snap.running:
+    if listen_clicked and not snap.listening:
+        thread, stop_event = ck.start_voice_session(cstate, tools=tools, budgets=budgets)
+        st.session_state["cockpit_voice_stop"] = stop_event
+        time.sleep(0.3)
+        st.rerun()
+    if stop_clicked:
+        ev = st.session_state.get("cockpit_voice_stop")
+        if ev is not None:
+            ev.set()
+        time.sleep(0.3)
+        st.rerun()
+
+    with st.expander("⌨️ Text fallback (no mic / CI)", expanded=not snap.listening):
+        c_in, c_send, c_panic = st.columns([5, 1, 1])
+        with c_in:
+            st.text_input(
+                "Nurse utterance", key="cockpit_utterance",
+                placeholder="patient in bed 12 looks septic",
+                label_visibility="collapsed", disabled=snap.running or snap.listening,
+            )
+        with c_send:
+            send_clicked = st.button(
+                "▶ Send", use_container_width=True, disabled=snap.running or snap.listening
+            )
+        with c_panic:
+            panic_clicked = st.button(
+                "🚨 PANIC", type="primary", use_container_width=True,
+                disabled=snap.running or snap.listening,
+                help="Force urgency=EMERGENCY (hard badge override).",
+            )
+        st.caption(
+            "Routing examples — *page the on-call cardiologist* → SIRE resolve + page · "
+            "*patient in bed 12 looks septic* → sepsis hour-1 · *code blue in 4 West* → fast path."
+        )
+
+    if (send_clicked or panic_clicked) and not snap.running and not snap.listening:
         utt = st.session_state.get("cockpit_utterance", "")
         if utt or panic_clicked:
             ck.start_run(cstate, utt, panic=panic_clicked, tools=tools, budgets=budgets)
@@ -620,7 +652,15 @@ def _render_cockpit() -> None:
 
     snap = cstate.snapshot()
     if snap.error:
-        st.error(f"Run failed: {snap.error}")
+        st.error(f"⚠️ {snap.error}")
+
+    # ── Live routing flow visualizer (the money shot) ───────────────────
+    st.subheader("🗺️ Live routing flow")
+    st.caption(
+        "What the front door did with this utterance: voice → intent + urgency → the chosen "
+        "downstream workflow, with each concurrent branch lit as it runs."
+    )
+    st.graphviz_chart(ck.flow_dot(snap))
 
     # ── Transcript | Orchestration cockpit ──────────────────────────────
     col_t, col_c = st.columns([2, 3])
@@ -650,8 +690,8 @@ def _render_cockpit() -> None:
             st.metric("Emergency acknowledgment latency", f"{snap.ack_latency_ms:.0f} ms",
                       help=f"Budget {budgets.spoken_ack_ms} ms — spoken before any tool runs.")
 
-    # ── Live refresh while the run streams ──────────────────────────────
-    if snap.running:
+    # ── Live refresh while the run streams or the mic is open ───────────
+    if snap.running or snap.listening:
         time.sleep(0.4)
         st.rerun()
 
@@ -659,7 +699,7 @@ def _render_cockpit() -> None:
 def _render_cockpit_transcript(snap) -> None:
     st.subheader("💬 Live transcript")
     if not snap.transcript:
-        st.info("Type an utterance (or hit PANIC) to drive the front door.")
+        st.info("Start listening and speak — or use the text fallback — to drive the front door.")
         return
     box = st.container(height=440)
     with box:

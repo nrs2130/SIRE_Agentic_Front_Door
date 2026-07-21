@@ -23,6 +23,7 @@ Threading: :func:`start_run` spawns a daemon thread that runs the async driver; 
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import threading
@@ -45,6 +46,42 @@ logger = logging.getLogger("nightingale.demo.cockpit")
 # Foundry portal — the Control Plane entry point (see infra/CONTROL_PLANE.md).
 _FOUNDRY_PORTAL = "https://ai.azure.com"
 _HOUR1_WINDOW_S = 3600.0
+
+# Realistic latency profile for the mock adapters (NOT a demo dial). These model the
+# real downstream round-trips the tools stand in for — a Vocera Engage page, an HL7 lab
+# order, an EHR/patient-context read — so the fan-out parallelism and the ack-first
+# behavior are demonstrated honestly rather than with an artificial slowdown knob.
+_REALISTIC_BASE_MS = 400
+_REALISTIC_JITTER_MS = 450
+
+
+def realistic_tools() -> ToolsConfig:
+    """Mock tools with a realistic, fixed latency profile (models real downstream systems)."""
+    return ToolsConfig(
+        use_real_adapter=False,
+        mock_latency_ms=_REALISTIC_BASE_MS,
+        mock_jitter_ms=_REALISTIC_JITTER_MS,
+        timeout_ms=8000,
+    )
+
+
+# Human-readable workflow names the router dispatches to (for the flow visualizer + UI).
+WORKFLOW_LABELS: dict[str, str] = {
+    "sepsis": "Sepsis Hour-1 Emergency Bundle",
+    "emergency": "Emergency Fast Path",
+    "sire": "SIRE — resolve person + Engage page",
+    "standard": "Standard workflow",
+}
+
+# Node status -> fill colour for the live flow graph (Graphviz).
+_STATUS_FILL: dict[str, str] = {
+    "queued": "#eceff1",
+    "running": "#64b5f6",
+    "done": "#66bb6a",
+    "breach": "#ffb74d",
+    "failed": "#ef5350",
+    "idle": "#f5f5f5",
+}
 
 _BRANCH_START_RE = re.compile(r"^\[(\w+)\]")
 _BRANCH_BREACH_RE = re.compile(r"[Ss]till working on (\w+)")
@@ -79,6 +116,23 @@ def emergency_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
         BranchMeta("knowledge", "retrieving hour-1 protocol", budgets.knowledge_ms, "protocol retrieved"),
         BranchMeta("context", "pulling patient context", budgets.patient_context_ms, "context ready"),
     ]
+
+
+def standard_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
+    """The two concurrent enrich branches of the standard/SIRE path (mirrors StandardEnrich)."""
+    return [
+        BranchMeta("patient_context", "patient context lookup", budgets.patient_context_ms, "context ready"),
+        BranchMeta("oncall", "on-call schedule lookup", budgets.comms_tool_ms, "on-call ready"),
+    ]
+
+
+def workflow_key(intent: str, path: str) -> str:
+    """Map (intent, path) to a workflow key for the flow visualizer."""
+    if path == "fast":
+        return "sepsis" if intent in SEPSIS_INTENTS else "emergency"
+    if intent in {"contact_provider", "panic_button"} or intent.startswith("contact"):
+        return "sire" if intent == "contact_provider" else "standard"
+    return "standard"
 
 
 @dataclass
@@ -165,6 +219,7 @@ class CockpitState:
     def reset(self) -> None:
         with self._lock:
             self.running: bool = False
+            self.listening: bool = False
             self.error: str | None = None
             self.utterance: str = ""
             self.intent: str = ""
@@ -221,6 +276,11 @@ class CockpitState:
         with self._lock:
             self.error = error
             self.running = False
+
+    def set_listening(self, value: bool) -> None:
+        """Voice front door session state (mic open / closed)."""
+        with self._lock:
+            self.listening = value
 
     def speak(self, text: str) -> None:
         """Fold one spoken line into transcript + branch/checklist state (the event stream)."""
@@ -317,6 +377,7 @@ class CockpitState:
         with self._lock:
             return CockpitSnapshot(
                 running=self.running,
+                listening=self.listening,
                 error=self.error,
                 utterance=self.utterance,
                 intent=self.intent,
@@ -337,6 +398,7 @@ class CockpitSnapshot:
     """Immutable point-in-time copy of :class:`CockpitState` for rendering."""
 
     running: bool
+    listening: bool
     error: str | None
     utterance: str
     intent: str
@@ -389,7 +451,7 @@ async def run_cockpit(
     sepsis emergency to :class:`SepsisHour1Workflow`, any other emergency to the hardened
     :class:`FastPath`, and routine work to the standard graph — reusing each as-is.
     """
-    tools = tools or ToolsConfig.from_env()
+    tools = tools or realistic_tools()
     budgets = budgets or LatencyBudgets.from_env()
     state.reset()
     gateway = _CockpitGateway(state)
@@ -401,7 +463,20 @@ async def run_cockpit(
             intent = "panic_button"
     envelope = IntentEnvelope.create(intent, urgency, entities, utterance or "[PANIC BUTTON]")
     state.start(utterance, envelope)
+    await _drive(state, gateway, envelope, tools, budgets, window_s)
+    return state
 
+
+async def _drive(
+    state: CockpitState,
+    gateway: VoiceGatewayBase,
+    envelope: IntentEnvelope,
+    tools: ToolsConfig,
+    budgets: LatencyBudgets,
+    window_s: float,
+) -> None:
+    """Dispatch a built envelope to the right workflow, streaming live state (shared by
+    the text and voice front doors). Never lets the UI thread see a raw crash."""
     try:
         is_emergency = envelope.urgency is Urgency.EMERGENCY
         is_sepsis = envelope.intent in SEPSIS_INTENTS
@@ -414,7 +489,6 @@ async def run_cockpit(
     except Exception as exc:  # never let the UI thread see a raw crash
         logger.exception("cockpit run failed correlation_id=%s", envelope.correlation_id)
         state.fail(str(exc))
-    return state
 
 
 async def _run_sepsis(
@@ -470,8 +544,12 @@ async def _run_standard(
     budgets: LatencyBudgets,
 ) -> None:
     state.set_path("standard")
+    state.set_branches(standard_branch_meta(budgets))
     orch = Orchestrator(gateway, fast_path=FastPath(gateway, budgets=budgets, tools=tools))
     result = await orch.handle(envelope)
+    # The standard graph doesn't surface per-branch latencies to the cockpit; the enrich
+    # branches ran concurrently and completed, so finalize them as done for the flow view.
+    state.finalize_branches({}, {})
     state.finish(result.summary or "", None)
 
 
@@ -491,6 +569,82 @@ def build_checklist(snapshot: CockpitSnapshot) -> list[ChecklistItem]:
             status = "proposed"
         items.append(ChecklistItem(order, category, text, status))
     return items
+
+
+# --- Live flow visualizer (Graphviz DOT) -------------------------------------
+# Renders the routing map so the audience SEES which downstream workflow the voice
+# front door chose for the utterance, with each node lit by live status. Client-side
+# rendered by st.graphviz_chart (viz.js) — no system Graphviz needed.
+_WORKFLOW_ROUTES: tuple[tuple[str, str], ...] = (
+    ("sepsis", "EMERGENCY · sepsis"),
+    ("emergency", "EMERGENCY · code / RRT / stroke / fall"),
+    ("sire", "ROUTINE · page / contact a provider"),
+    ("standard", "ROUTINE · locate / blood / general"),
+)
+
+
+def _fill(status: str) -> str:
+    return _STATUS_FILL.get(status, _STATUS_FILL["idle"])
+
+
+def _node(node_id: str, label: str, status: str, *, bold: bool = False) -> str:
+    fill = _fill(status)
+    pen = ' penwidth=2 color="#37474f"' if bold else ' color="#b0bec5"'
+    font = "#ffffff" if status in ("running", "done", "breach", "failed") else "#546e7a"
+    return f'{node_id} [label="{label}" fillcolor="{fill}" fontcolor="{font}"{pen}];'
+
+
+def flow_dot(snapshot: CockpitSnapshot) -> str:
+    """Build a Graphviz DOT graph of the live routing flow for ``snapshot``.
+
+    Shows the voice front door → router → the four candidate workflows, with the chosen
+    one and its concurrent branches lit by live status (queued → running → done/breach).
+    Answers 'what flow is happening for this query' at a glance.
+    """
+    started = bool(snapshot.path) or bool(snapshot.transcript)
+    active = workflow_key(snapshot.intent, snapshot.path) if snapshot.path else None
+    running = snapshot.running
+
+    badge_s = "done" if started else "idle"
+    gw_s = "done" if snapshot.intent else "idle"
+    router_s = "running" if (running and snapshot.path) else ("done" if snapshot.path else "idle")
+
+    urgency = snapshot.urgency or "urgency"
+    lines: list[str] = [
+        "digraph nightingale {",
+        "  rankdir=TB; bgcolor=\"transparent\"; pad=0.2; nodesep=0.35; ranksep=0.45;",
+        '  node [shape=box style="rounded,filled" fontname="Segoe UI" fontsize=11];',
+        '  edge [color="#90a4ae" fontname="Segoe UI" fontsize=9];',
+        f'  {_node("badge", "🎧 Badge / mic", badge_s)}',
+        f'  {_node("gateway", "Voice Gateway\\ngpt-realtime · Intent + urgency", gw_s)}',
+        f'  {_node("router", f"Router\\n{urgency}", router_s)}',
+        "  badge -> gateway; gateway -> router;",
+    ]
+
+    for key, cond in _WORKFLOW_ROUTES:
+        is_active = key == active
+        if is_active:
+            wf_status = "running" if running else ("done" if snapshot.summary else "running")
+        else:
+            wf_status = "idle"
+        lines.append(f'  {_node(f"wf_{key}", WORKFLOW_LABELS[key], wf_status, bold=is_active)}')
+        edge_style = "" if is_active else ' style=dashed color="#cfd8dc"'
+        lines.append(f'  router -> wf_{key} [label="{cond}"{edge_style}];')
+
+    # Light up the active workflow's concurrent branches + the human-in-the-loop terminal.
+    if active and snapshot.branches:
+        for b in snapshot.branches:
+            nid = f"br_{active}_{b.name}"
+            tag = "⚡ " if b.escalation else ""
+            lines.append(f'  {_node(nid, f"{tag}{b.name}\\n{b.label}", b.status)}')
+            lines.append(f"  wf_{active} -> {nid};")
+        term_s = "done" if (snapshot.summary and not running) else "idle"
+        lines.append(f'  {_node(f"ack_{active}", "Read-back &\\nclinician confirm", term_s)}')
+        for b in snapshot.branches:
+            lines.append(f"  br_{active}_{b.name} -> ack_{active};")
+
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def start_run(
@@ -513,3 +667,105 @@ def start_run(
     thread = threading.Thread(target=_target, name="cockpit-run", daemon=True)
     thread.start()
     return thread
+
+
+# --- Voice front door (Azure Voice Live, gpt-realtime) -----------------------
+# The demo's thesis: the nurse SPEAKS; the front door classifies intent + urgency and
+# routes to the right downstream workflow. This runs the existing VoiceLiveGateway and
+# drives the same cockpit per emitted IntentEnvelope — the mic is the primary input; the
+# text box is only a mic-less / CI fallback. Heavy deps (azure-ai-voicelive, pyaudio) are
+# imported lazily inside the session, so importing this module stays CI-safe.
+
+
+class _VoiceCockpitGateway(VoiceGatewayBase):
+    """Bridges the live Voice Live gateway's spoken channel into a :class:`CockpitState`.
+
+    Subclassing the real gateway would pull in audio deps at import; instead we compose:
+    the Voice Live gateway (built lazily in the session) emits envelopes, and its
+    ``speak`` is redirected here so orchestrator progress lands in the cockpit.
+    """
+
+    def __init__(self, state: CockpitState) -> None:
+        super().__init__(None)
+        self._state = state
+
+    async def speak(self, text: str) -> None:
+        self._state.speak(text)
+
+
+async def run_voice_cockpit(
+    state: CockpitState,
+    *,
+    tools: ToolsConfig | None = None,
+    budgets: LatencyBudgets | None = None,
+    window_s: float = _HOUR1_WINDOW_S,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Open a Voice Live session and drive the cockpit for each spoken utterance.
+
+    Consumes the gateway's :class:`IntentEnvelope` stream; each envelope resets the cockpit
+    and runs the routed workflow via :func:`_drive`. Errors (no mic, no creds) surface on
+    ``state.error`` rather than crashing the UI thread.
+    """
+    tools = tools or realistic_tools()
+    budgets = budgets or LatencyBudgets.from_env()
+    state.reset()
+    state.set_listening(True)
+    try:
+        # Lazy: keep the module importable without Azure Voice Live / pyaudio installed.
+        from azure.identity.aio import AzureCliCredential  # noqa: PLC0415
+        from config import AppConfig  # noqa: PLC0415
+        from src.gateway.gateway import VoiceLiveGateway  # noqa: PLC0415
+
+        cfg = AppConfig.from_env()
+        bridge = _VoiceCockpitGateway(state)
+
+        async with AzureCliCredential() as credential:
+            gateway = VoiceLiveGateway(cfg, credential)
+            # Redirect the live gateway's spoken channel into the cockpit bridge.
+            gateway.speak = bridge.speak  # type: ignore[method-assign]
+
+            async def _consume() -> None:
+                async for env in gateway.envelopes():
+                    state.reset()
+                    state.set_listening(True)
+                    state.start(env.utterance or "(voice)", env)
+                    await _drive(state, gateway, env, tools, budgets, window_s)
+
+            consumer = asyncio.create_task(_consume())
+            session = asyncio.create_task(gateway.run())
+            while not session.done():
+                if stop_event is not None and stop_event.is_set():
+                    gateway.close()
+                    break
+                await asyncio.sleep(0.2)
+            session.cancel()
+            consumer.cancel()
+            await asyncio.gather(session, consumer, return_exceptions=True)
+    except Exception as exc:  # no mic / no creds / SDK missing — degrade gracefully
+        logger.exception("voice front door failed")
+        state.fail(f"Voice front door unavailable: {exc}")
+    finally:
+        state.set_listening(False)
+
+
+def start_voice_session(
+    state: CockpitState,
+    *,
+    tools: ToolsConfig | None = None,
+    budgets: LatencyBudgets | None = None,
+) -> tuple[threading.Thread, threading.Event]:
+    """Spawn a daemon thread running the Voice Live front door; returns (thread, stop_event)."""
+    stop_event = threading.Event()
+
+    def _target() -> None:
+        try:
+            asyncio.run(
+                run_voice_cockpit(state, tools=tools, budgets=budgets, stop_event=stop_event)
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            state.fail(str(exc))
+
+    thread = threading.Thread(target=_target, name="cockpit-voice", daemon=True)
+    thread.start()
+    return thread, stop_event

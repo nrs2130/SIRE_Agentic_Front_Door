@@ -12,8 +12,11 @@ from src.demo.cockpit import (
     CockpitState,
     build_checklist,
     control_plane_url,
+    flow_dot,
+    realistic_tools,
     run_cockpit,
     sepsis_branch_meta,
+    workflow_key,
 )
 from src.gateway.intent_envelope import Urgency
 
@@ -127,3 +130,56 @@ def test_sepsis_branch_meta_matches_budgets() -> None:
 
 def test_control_plane_url_is_foundry_portal() -> None:
     assert control_plane_url().startswith("https://ai.azure.com")
+
+
+# --- Routing map / flow visualizer -------------------------------------------
+def test_realistic_tools_is_a_fixed_profile() -> None:
+    """The mock profile is fixed + realistic (models real downstream systems), not a dial."""
+    t = realistic_tools()
+    assert t.use_real_adapter is False
+    assert 100 <= t.mock_latency_ms <= 2000  # a plausible downstream round-trip
+    assert t.mock_jitter_ms > 0
+
+
+def test_workflow_key_routes_intents() -> None:
+    assert workflow_key("sepsis_screen", "fast") == "sepsis"
+    assert workflow_key("code_blue", "fast") == "emergency"
+    assert workflow_key("contact_provider", "standard") == "sire"
+    assert workflow_key("locate_equipment", "standard") == "standard"
+
+
+async def test_contact_provider_routes_to_sire_workflow() -> None:
+    """'page the on-call cardiologist' → standard path, SIRE resolve+page workflow."""
+    state = CockpitState()
+    await run_cockpit(state, "page the on-call cardiologist", tools=_FAST_TOOLS)
+    snap = state.snapshot()
+    assert snap.path == "standard"
+    assert snap.intent == "contact_provider"
+    assert workflow_key(snap.intent, snap.path) == "sire"
+    # The SIRE/standard path surfaces its concurrent enrich branches for the flow view.
+    assert [b.name for b in snap.branches] == ["patient_context", "oncall"]
+
+
+async def test_flow_dot_lights_active_workflow_only() -> None:
+    """The routing graph shows all four candidate workflows but lights only the chosen one."""
+    state = CockpitState()
+    await run_cockpit(state, "patient in bed 12 looks septic", tools=_FAST_TOOLS)
+    dot = flow_dot(state.snapshot())
+
+    assert dot.startswith("digraph")
+    # Front-door nodes + all four candidate workflows are always drawn (the map).
+    for node in ("badge", "gateway", "router", "wf_sepsis", "wf_emergency", "wf_sire", "wf_standard"):
+        assert node in dot
+    # The chosen workflow's concurrent branches are rendered as lit child nodes.
+    for name in ("comms", "orders", "knowledge", "timer"):
+        assert f"br_sepsis_{name}" in dot
+    # Inactive routes are dashed; the active one is not.
+    assert "wf_emergency" in dot and "style=dashed" in dot
+
+
+def test_flow_dot_handles_empty_prerun_snapshot() -> None:
+    """Before any run the map still renders (all candidates idle), so the presenter can show it."""
+    dot = flow_dot(CockpitState().snapshot())
+    assert dot.startswith("digraph") and dot.rstrip().endswith("}")
+    assert all(f"wf_{k}" in dot for k in ("sepsis", "emergency", "sire", "standard"))
+
