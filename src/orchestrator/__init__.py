@@ -1,5 +1,6 @@
 """L2 Orchestrator: Agent Framework workflow — router, fast/standard paths, fan-out/fan-in, latency budgets."""
 
+from .fastpath import BranchOutcome, BranchSpec, FastPath, FastPathResult
 from .messages import (
     BranchResult,
     BranchTask,
@@ -13,6 +14,10 @@ __all__ = [
     "Orchestrator",
     "OrchestrationResult",
     "build_workflow",
+    "FastPath",
+    "FastPathResult",
+    "BranchSpec",
+    "BranchOutcome",
     "FastPathRequest",
     "StandardPathRequest",
     "BranchTask",

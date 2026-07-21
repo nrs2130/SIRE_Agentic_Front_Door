@@ -38,6 +38,7 @@ from .executors import (
     StandardSummary,
     make_mock_agent,
 )
+from .fastpath import FastPath
 
 if TYPE_CHECKING:
     from src.gateway.gateway import VoiceGatewayBase
@@ -113,14 +114,17 @@ class OrchestrationResult:
     path: str  # "fast" | "standard"
     spoken: list[str] = field(default_factory=list)  # intermediate cues, in order
     summary: str | None = None  # final spoken summary
+    ack_latency_ms: float | None = None  # emergency acknowledgment latency (fast path)
+    branch_latencies_ms: dict[str, float] = field(default_factory=dict)  # per-branch (fast path)
 
 
 class Orchestrator:
     """Drives the workflow for one :class:`IntentEnvelope` and streams speech.
 
-    Consumes the envelope, runs the Agent Framework workflow with streaming, and
-    forwards every intermediate output to the gateway's ``speak()`` as it arrives
-    (live progress), then speaks the final summary.
+    EMERGENCY envelopes take the hardened :class:`FastPath` (acknowledge-first, escalate-first,
+    budgeted, speculative — docs §3.2). ROUTINE envelopes run the standard-path workflow graph.
+    Either way, every intermediate spoken update is forwarded to the gateway's ``speak()`` as
+    it arrives, then the final summary is spoken.
     """
 
     def __init__(
@@ -129,21 +133,42 @@ class Orchestrator:
         *,
         branch_delay: float = _DEFAULT_BRANCH_DELAY,
         branch_budget: float = _DEFAULT_BUDGET,
+        fast_path: "FastPath | None" = None,
     ) -> None:
         self._gateway = gateway
         self._workflow = build_workflow(
             branch_delay=branch_delay, branch_budget=branch_budget
         )
+        self._fast_path = fast_path or FastPath(gateway)
 
     async def handle(self, envelope: IntentEnvelope) -> OrchestrationResult:
-        """Run the workflow, streaming spoken updates back through the gateway."""
+        """Run the emergency fast path or the standard graph, streaming spoken updates."""
         cid = envelope.correlation_id
-        path = "fast" if envelope.urgency is Urgency.EMERGENCY else "standard"
+        if envelope.urgency is Urgency.EMERGENCY:
+            return await self._handle_fast(envelope)
+        return await self._handle_standard(envelope)
+
+    async def _handle_fast(self, envelope: IntentEnvelope) -> OrchestrationResult:
+        """Emergency: delegate to the hardened FastPath (it streams via the gateway itself)."""
+        cid = envelope.correlation_id
         logger.info(
-            "orchestration start correlation_id=%s urgency=%s path=%s",
-            cid, envelope.urgency.value, path,
+            "orchestration start correlation_id=%s urgency=EMERGENCY path=fast", cid
         )
-        result = OrchestrationResult(correlation_id=cid, path=path)
+        fp = await self._fast_path.run(envelope)
+        logger.info("orchestration done correlation_id=%s path=fast", cid)
+        return OrchestrationResult(
+            correlation_id=cid, path="fast", spoken=fp.spoken, summary=fp.summary,
+            ack_latency_ms=fp.ack_latency_ms, branch_latencies_ms=fp.branch_latencies_ms,
+        )
+
+    async def _handle_standard(self, envelope: IntentEnvelope) -> OrchestrationResult:
+        """Routine: run the standard-path workflow graph with streaming."""
+        cid = envelope.correlation_id
+        logger.info(
+            "orchestration start correlation_id=%s urgency=%s path=standard",
+            cid, envelope.urgency.value,
+        )
+        result = OrchestrationResult(correlation_id=cid, path="standard")
         async for event in self._workflow.run(envelope, stream=True):
             etype = getattr(event, "type", None)
             if etype == "intermediate":
@@ -153,5 +178,5 @@ class Orchestrator:
             elif etype == "output":
                 result.summary = str(event.data)
                 await self._gateway.speak(result.summary)
-        logger.info("orchestration done correlation_id=%s path=%s", cid, path)
+        logger.info("orchestration done correlation_id=%s path=standard", cid)
         return result
