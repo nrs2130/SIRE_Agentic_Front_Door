@@ -140,8 +140,15 @@ def test_registered_with_router_for_its_intents() -> None:
         assert reg.factory is create_sepsis_agent
 
 
-def test_hosted_registration_dry_run_prints_plan(capsys) -> None:
+def test_hosted_registration_dry_run_prints_plan(capsys, monkeypatch) -> None:
     """--dry-run plan includes the Foundry IQ KB tool + the three action tools, no Azure."""
+    # Hermetic: build the spec from its documented defaults, independent of any local .env
+    # (config.py load_dotenv(override=True) would otherwise leak real endpoints/connection ids).
+    for var in (
+        "FOUNDRY_IQ_KB_CONNECTION", "FOUNDRY_IQ_KB_MCP_URL", "MCP_LABS_HL7_URL",
+        "MCP_COMMS_PAGE_URL", "MCP_PATIENT_CONTEXT_URL", "FOUNDRY_MODEL_NAME",
+    ):
+        monkeypatch.delenv(var, raising=False)
     spec = sepsis_hosted_agent_spec()
     plan = register_hosted_agent(spec, project_endpoint=None, dry_run=True)
 

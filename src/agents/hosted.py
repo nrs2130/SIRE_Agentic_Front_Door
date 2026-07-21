@@ -98,27 +98,42 @@ def register_hosted_agent(
 
     # --- Real registration (lazy Azure imports; no Azure needed for dry-run/local) ---
     from azure.ai.projects import AIProjectClient  # noqa: PLC0415  (azure-ai-projects==2.3.0)
+    from azure.ai.projects.models import (  # noqa: PLC0415
+        MCPTool,
+        PromptAgentDefinition,
+    )
     from azure.identity import DefaultAzureCredential  # noqa: PLC0415
 
     logger.info("creating hosted agent %r in %s", spec.name, project_endpoint)
     with DefaultAzureCredential() as credential, AIProjectClient(
         endpoint=project_endpoint, credential=credential
     ) as client:
-        # Verified pattern (azure-ai-projects>=2.0.0; repo pins 2.3.0) from
+        # Declarative (prompt) agent: model + instructions + MCP tool defs. Verified pattern
+        # (azure-ai-projects>=2.0.0; repo pins 2.3.0) from
         # https://learn.microsoft.com/azure/foundry/agents/how-to/foundry-iq-connect
-        # (fetched 2026-07-20):
-        #   from azure.ai.projects.models import PromptAgentDefinition, MCPTool
-        #   tools = [MCPTool(server_label=..., server_url=..., require_approval="never",
-        #                    allowed_tools=[...], project_connection_id=...)]
-        #   client.agents.create_version(agent_name=spec.name,
-        #       definition=PromptAgentDefinition(model=spec.model,
-        #           instructions=spec.instructions, tools=tools))
-        # Foundry IQ knowledge-base tools additionally require a RemoteTool project
-        # connection (ProjectManagedIdentity) created via ARM before this call.
-        # TODO: wire the concrete create_version call + connection provisioning when
-        # running for real (kept dry-run-only here to avoid unverified side effects).
-        raise NotImplementedError(
-            "Real hosted-agent creation is not wired yet. Run with --dry-run to see the "
-            "plan; implement client.agents.create_version(...) per the pinned "
-            "azure-ai-projects==2.3.0 API to go live."
+        # (fetched 2026-07-21). A Foundry IQ knowledge-base tool additionally needs a RemoteTool
+        # project connection (ProjectManagedIdentity) created via ARM BEFORE this call — see
+        # infra/deploy.ps1 / src/knowledge/ingest.py kb_connection_plan().
+        # TODO: verify MCPTool/PromptAgentDefinition/create_version signatures against the
+        # installed azure-ai-projects==2.3.0 (doc examples can lag the SDK); adjust kwargs if so.
+        tools = []
+        for t in spec.mcp_tools:
+            kwargs: dict = {
+                "server_label": t.server_label,
+                "server_url": t.server_url,
+                "require_approval": t.require_approval,
+                "allowed_tools": list(t.allowed_tools),
+            }
+            if t.project_connection_id is not None:
+                kwargs["project_connection_id"] = t.project_connection_id
+            tools.append(MCPTool(**kwargs))
+
+        agent = client.agents.create_version(
+            agent_name=spec.name,
+            definition=PromptAgentDefinition(
+                model=spec.model, instructions=spec.instructions, tools=tools
+            ),
         )
+        version = getattr(agent, "version", None)
+        logger.info("hosted agent %r created (version=%s)", spec.name, version)
+        return {**plan, "created": True, "version": version}
