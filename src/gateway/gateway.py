@@ -186,6 +186,12 @@ class VoiceLiveGateway(VoiceGatewayBase):
         self._active_response = False
         self._response_done = False
         self._last_utterance = ""
+        # The realtime model re-calls route_intent multiple times for a single spoken
+        # utterance (each orchestrator talk-back response prompts it to re-classify). We
+        # emit ONE envelope per utterance and suppress the repeats — otherwise every repeat
+        # resets the cockpit and launches an overlapping workflow run (an apparent "loop").
+        # Reset on each new transcription so the next spoken request is processed afresh.
+        self._last_emitted_utterance: str | None = None
         # Serialize spoken talk-back so successive updates don't render overlapping
         # Voice Live responses (which sound like two voices talking over each other).
         self._speak_lock = asyncio.Lock()
@@ -290,6 +296,8 @@ class VoiceLiveGateway(VoiceGatewayBase):
         # Capture the verbatim utterance for the envelope.
         elif str(etype) == "conversation.item.input_audio_transcription.completed":
             self._last_utterance = getattr(event, "transcript", "") or ""
+            # New spoken turn — allow the next route_intent to emit (see dedupe below).
+            self._last_emitted_utterance = None
 
         # route_intent function call: accumulate args, then build the envelope.
         elif etype == ServerEventType.CONVERSATION_ITEM_CREATED:
@@ -306,7 +314,14 @@ class VoiceLiveGateway(VoiceGatewayBase):
             args_str = getattr(event, "arguments", self._fn_call_args)
             if name == "route_intent":
                 envelope = self._build_envelope(args_str)
-                self._emit(envelope)
+                # Collapse the model's repeat route_intent calls for the SAME utterance to a
+                # single envelope — repeats would reset the cockpit + spawn overlapping runs.
+                if self._register_emit(envelope.utterance):
+                    self._emit(envelope)
+                else:
+                    logger.debug(
+                        "suppressed duplicate route_intent for utterance=%r", envelope.utterance
+                    )
                 # Ack the tool call so the model doesn't hang. We deliberately do
                 # NOT call response.create() — the orchestrator owns spoken output.
                 await conn.conversation.item.create(
@@ -322,6 +337,20 @@ class VoiceLiveGateway(VoiceGatewayBase):
 
         elif etype == ServerEventType.ERROR:
             logger.error("Voice Live error: %s", getattr(event.error, "message", event))
+
+    def _register_emit(self, utterance: str) -> bool:
+        """Return True if this utterance should emit an envelope (first time this turn).
+
+        The realtime model re-calls ``route_intent`` several times for a single spoken
+        utterance; only the first should drive a workflow. Returns False for the repeats.
+        A new transcription resets ``_last_emitted_utterance`` so the next turn emits again.
+        An empty utterance is never deduped (we can't tell repeats apart).
+        """
+        if utterance and utterance == self._last_emitted_utterance:
+            return False
+        if utterance:
+            self._last_emitted_utterance = utterance
+        return True
 
     def _build_envelope(self, args_str: str) -> IntentEnvelope:
         """Build an :class:`IntentEnvelope` from a ``route_intent`` tool call."""
@@ -365,20 +394,31 @@ class VoiceLiveGateway(VoiceGatewayBase):
             except asyncio.TimeoutError:
                 logger.warning("prior spoken response did not complete in time; proceeding")
             try:
-                # OutputTextContentPart is part of azure-ai-voicelive 1.2.0; the
-                # assistant message item shape is guarded in case the symbol moves.
+                # The SESSION instructions make the model a SILENT router (it must not
+                # speak on its own), so a bare response.create() renders no audio. To voice
+                # the orchestrator's line we OVERRIDE the instructions for THIS response only
+                # and force audio out. tool_choice=none stops it re-calling route_intent.
                 from azure.ai.voicelive.models import (  # noqa: PLC0415
-                    AssistantMessageItem,
-                    OutputTextContentPart,
+                    Modality,
+                    ResponseCreateParams,
                 )
 
                 self._response_complete.clear()
-                await conn.conversation.item.create(
-                    item=AssistantMessageItem(content=[OutputTextContentPart(text=text)])
+                await conn.response.create(
+                    response=ResponseCreateParams(
+                        instructions=(
+                            "You are the spoken voice of the Nightingale orchestrator. "
+                            "Read the following message to the nurse VERBATIM, then stop. "
+                            "Do not add, summarize, translate, or change any words, and do "
+                            "not call any tool.\n\n"
+                            f"{text}"
+                        ),
+                        modalities=[Modality.TEXT, Modality.AUDIO],
+                        tool_choice="none",
+                    )
                 )
-                await conn.response.create()
             except Exception:  # pragma: no cover - depends on the live SDK/runtime
-                # TODO: verify assistant-message API against
+                # TODO: verify response-override API against
                 # https://learn.microsoft.com/azure/ai-services/speech-service/voice-live-how-to
                 self._response_complete.set()  # don't deadlock the next speak()
-                logger.exception("speak() failed; verify Voice Live assistant-message API")
+                logger.exception("speak() failed; verify Voice Live response-override API")

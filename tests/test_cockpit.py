@@ -178,6 +178,47 @@ def test_is_spoken_line_filters_cockpit_cues() -> None:
     assert is_spoken_line("Status: comms ✓, orders still working…") is False
 
 
+async def test_protocol_lookup_routes_to_knowledge_workflow() -> None:
+    """'what is the sepsis hour-1 bundle?' → ROUTINE knowledge lookup, cited + spoken back."""
+    state = CockpitState()
+    await run_cockpit(state, "What is the sepsis hour-1 bundle?", tools=_FAST_TOOLS)
+    snap = state.snapshot()
+    assert snap.intent == "protocol_lookup"
+    assert snap.urgency == "ROUTINE"  # a question about an emergency topic is still routine
+    assert snap.workflow == "knowledge"
+    assert [b.name for b in snap.branches] == ["retrieve"]
+    assert snap.knowledge.active is True
+    assert snap.knowledge.grounded is True
+    assert snap.knowledge.citations  # cites a real protocol source
+    assert snap.summary
+
+
+async def test_protocol_lookup_no_match_degrades_gracefully() -> None:
+    """A lookup with no corpus hit still narrates (failure path), no crash, no citation."""
+    state = CockpitState()
+    await run_cockpit(state, "What is the helicopter landing protocol?", tools=_FAST_TOOLS)
+    snap = state.snapshot()
+    assert snap.workflow == "knowledge"
+    assert snap.knowledge.grounded is False
+    assert snap.knowledge.citations == []
+    assert "couldn't find" in snap.summary.lower()
+
+
+async def test_check_blood_supply_routes_to_supply_workflow() -> None:
+    """'blood supply for bed 12' → supply lookup; reads units + crossmatch verbatim (read-only)."""
+    state = CockpitState()
+    await run_cockpit(state, "Check the blood supply for bed 12", tools=_FAST_TOOLS)
+    snap = state.snapshot()
+    assert snap.intent == "check_blood_supply"
+    assert snap.workflow == "supply"
+    assert [b.name for b in snap.branches] == ["blood_bank"]
+    assert snap.supply.active is True
+    assert snap.supply.units  # inventory read from the LIS mock
+    assert snap.supply.crossmatch_status == "complete"
+    assert snap.summary
+
+
+
 def test_is_sire_query_routes_lookups() -> None:
     from src.demo.cockpit import is_sire_query
 

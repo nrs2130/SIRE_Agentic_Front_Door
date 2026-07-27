@@ -46,6 +46,21 @@ _EMERGENCY_PATTERNS: tuple[str, ...] = (
 _EMERGENCY_RE = re.compile("|".join(_EMERGENCY_PATTERNS), re.IGNORECASE)
 
 
+# A protocol/guideline read-back question (vs the clinical event). A lookup phrasing PLUS a
+# clinical topic routes to the ROUTINE knowledge workflow, which reads the cited protocol back.
+_PROTOCOL_LOOKUP_RE = re.compile(
+    r"\b(what\s+is|what's|what\s+are|read\s+(?:me|back|out)|remind\s+me|walk\s+me\s+through|"
+    r"explain|describe|steps\s+(?:for|of|to)|criteria\s+for|how\s+do\s+(?:i|we)|"
+    r"look\s*up\s+the|pull\s+up\s+the|tell\s+me\s+(?:the|about))\b",
+    re.IGNORECASE,
+)
+_PROTOCOL_TOPIC_RE = re.compile(
+    r"\b(protocol|guideline|bundle|criteria|screening|screen|hour[-\s]?1|sepsis|septic|"
+    r"qsofa|sirs|lactate|blood\s+cultures|antibiotics|crystalloid|vasopressors|\bmap\b)\b",
+    re.IGNORECASE,
+)
+
+
 def classify_urgency(utterance: str) -> Urgency:
     """Return :attr:`Urgency.EMERGENCY` if the utterance names a critical event."""
     return Urgency.EMERGENCY if _EMERGENCY_RE.search(utterance) else Urgency.ROUTINE
@@ -54,6 +69,11 @@ def classify_urgency(utterance: str) -> Urgency:
 def classify_intent(utterance: str) -> str:
     """Map an utterance to a canonical intent verb (best-effort, keyword-based)."""
     t = utterance.lower()
+    # Protocol/guideline LOOKUPS ("what is the hour-1 bundle?", "read me the qSOFA criteria")
+    # are read-back questions, not the clinical event itself — resolve them first so a question
+    # that merely mentions "sepsis" routes to the (ROUTINE) knowledge lookup, not the bundle.
+    if _PROTOCOL_LOOKUP_RE.search(t) and _PROTOCOL_TOPIC_RE.search(t):
+        return "protocol_lookup"
     if "sepsis" in t or "septic" in t:
         return "sepsis_screen"
     if (
@@ -106,7 +126,11 @@ def extract_entities(utterance: str) -> dict[str, str]:
 
 def classify(utterance: str) -> tuple[str, Urgency, dict[str, str]]:
     """Return ``(intent, urgency, entities)`` for an utterance in one cheap pass."""
-    return classify_intent(utterance), classify_urgency(utterance), extract_entities(utterance)
+    intent = classify_intent(utterance)
+    # A protocol read-back question is always ROUTINE even if it names an emergency topic
+    # (e.g. "what is the sepsis hour-1 bundle?") — it is a lookup, not the clinical event.
+    urgency = Urgency.ROUTINE if intent == "protocol_lookup" else classify_urgency(utterance)
+    return intent, urgency, extract_entities(utterance)
 
 
 # --- Voice Live function-calling schema -------------------------------------
@@ -130,7 +154,9 @@ ROUTE_INTENT_TOOL: dict[str, Any] = {
                     "Canonical intent verb, e.g. sepsis_screen, code_blue, "
                     "fall_response, rapid_response, stroke_alert, stemi_alert, "
                     "contact_provider, locate_equipment, check_blood_supply, "
-                    "general_request."
+                    "protocol_lookup, general_request. Use protocol_lookup when the nurse "
+                    "ASKS ABOUT or asks you to read back a protocol/guideline/criteria "
+                    "(e.g. 'what is the hour-1 sepsis bundle', 'read me the qSOFA criteria')."
                 ),
             },
             "urgency": {
@@ -139,7 +165,9 @@ ROUTE_INTENT_TOOL: dict[str, Any] = {
                 "description": (
                     "EMERGENCY for time-critical clinical events (sepsis, code blue, "
                     "cardiac/respiratory arrest, fall, stroke, STEMI, hemorrhage, "
-                    "rapid response). ROUTINE for everything else. Decide this here."
+                    "rapid response). ROUTINE for everything else, including a "
+                    "protocol_lookup question that merely names an emergency topic. "
+                    "Decide this here."
                 ),
             },
             "entities": {
@@ -151,6 +179,7 @@ ROUTE_INTENT_TOOL: dict[str, Any] = {
                     "role": {"type": "string"},
                     "person": {"type": "string"},
                     "group": {"type": "string"},
+                    "topic": {"type": "string"},
                 },
                 "additionalProperties": {"type": "string"},
             },

@@ -676,6 +676,10 @@ def _render_cockpit() -> None:
     if snap.sire.active:
         _render_cockpit_sire(snap)
 
+    # ── Protocol lookup panel (when active) ─────────────────────────────
+    if snap.knowledge.active:
+        _render_cockpit_knowledge(snap)
+
     # ── Control Plane link ──────────────────────────────────────────────
     st.markdown("---")
     cp_col, sum_col = st.columns([1, 3])
@@ -848,6 +852,61 @@ def _render_cockpit_sire(snap) -> None:
                 st.caption("_no group match_")
         st.caption("Both the user and group indexes are searched (multi-strategy RRF). "
                    "Paging augments Vocera Engage's routing — a human still acknowledges and acts.")
+
+
+def _render_cockpit_knowledge(snap) -> None:
+    st.markdown("---")
+    k = snap.knowledge
+    st.subheader("📖 Protocol lookup — Foundry IQ (cited)")
+    st.caption(
+        f"Grounded read-back for **{k.query}** from the clinical protocol knowledge base "
+        "(the same corpus behind the sepsis KB). Decision support only — nothing is ordered."
+    )
+    col_ans, col_cite = st.columns([3, 2])
+    with col_ans:
+        st.markdown("**Spoken answer**")
+        if k.answer:
+            st.info(k.answer)
+        else:
+            st.warning("No matching protocol found — ask the nurse to rephrase or name the guideline.")
+    with col_cite:
+        st.markdown("**Grounding**")
+        if k.grounded:
+            st.success("Protocol retrieved & cited (Foundry IQ)")
+        for sid, title, url in k.citations:
+            st.markdown(f"- [{sid}]({url}) — {title}")
+        st.caption("The agent reads back the cited guideline; a clinician still decides and acts.")
+
+
+_SUPPLY_PRODUCT_NAMES = {
+    "prbc": "Red cells (PRBC)", "ffp": "Plasma (FFP)", "platelets": "Platelets",
+    "cryo": "Cryoprecipitate", "whole_blood": "Whole blood",
+}
+
+
+def _render_cockpit_supply(snap) -> None:
+    st.markdown("---")
+    s = snap.supply
+    st.subheader("🩸 Blood bank — LIS availability (read-only)")
+    st.caption(
+        f"Read-only availability + crossmatch for **{s.query}** from the LIS / blood bank. "
+        "The agent reports units verbatim — it never orders, reserves, or releases blood."
+    )
+    if not s.units:
+        st.warning("No availability was read — retry or call the blood bank directly.")
+        return
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Patient blood type", s.patient_blood_type or "—")
+    xm = (s.crossmatch_status or "none").replace("_", " ")
+    m2.metric("Crossmatch", xm, delta=(f"{s.crossmatch_units_ready} ready"
+              if s.crossmatch_units_ready else None), delta_color="off")
+    m3.metric("MTP", "available" if s.mtp_available else "—")
+    st.markdown("**Inventory** (verbatim from LIS)")
+    for product, n, btype, loc in s.units:
+        name = _SUPPLY_PRODUCT_NAMES.get(product, product)
+        st.markdown(f"- **{n}** × {name} · `{btype}` · _{loc}_")
+    st.caption(f"Source: {s.source_system or 'LIS / Blood Bank'}. Read-only decision support — "
+               "a clinician orders and a human acts.")
 
 
 # ---------------------------------------------------------------------------

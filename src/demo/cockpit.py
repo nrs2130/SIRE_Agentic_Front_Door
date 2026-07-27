@@ -54,6 +54,10 @@ _HOUR1_WINDOW_S = 3600.0
 _REALISTIC_BASE_MS = 400
 _REALISTIC_JITTER_MS = 450
 
+# SIRE resolve budget: the multi-strategy RRF search fans out ~12 parallel Azure AI Search
+# queries, so its real latency is a few seconds — a realistic soft budget for the branch.
+_SIRE_RESOLVE_BUDGET_MS = 5000
+
 # Singleton guard for the live voice front door: only ONE Voice Live mic session may run at
 # a time (see start_voice_session). Two sessions would double-hear every utterance.
 _VOICE_SESSION_LOCK = threading.Lock()
@@ -75,6 +79,8 @@ WORKFLOW_LABELS: dict[str, str] = {
     "sepsis": "Sepsis Hour-1 Emergency Bundle",
     "emergency": "Emergency Fast Path",
     "sire": "SIRE — resolve person + Engage page",
+    "knowledge": "Protocol lookup — Foundry IQ (cited)",
+    "supply": "Blood bank lookup — LIS (read-only)",
     "standard": "Standard workflow",
 }
 
@@ -131,49 +137,73 @@ def standard_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
     ]
 
 
-def sire_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
-    """SIRE workflow branches: resolve a person + a group concurrently (RRF), then page."""
+def knowledge_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
+    """Protocol-lookup branch: retrieve the cited protocol from the Foundry IQ knowledge base."""
     return [
-        BranchMeta("resolve_person", "SIRE person resolution (RRF)", budgets.patient_context_ms, "person resolved"),
-        BranchMeta("resolve_group", "SIRE group resolution (RRF)", budgets.patient_context_ms, "group resolved"),
+        BranchMeta("retrieve", "retrieving cited protocol (Foundry IQ)", budgets.knowledge_ms, "protocol retrieved"),
+    ]
+
+
+def supply_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
+    """Blood-supply branch: read product availability + crossmatch from the LIS/blood bank."""
+    return [
+        BranchMeta("blood_bank", "reading LIS / blood bank", budgets.labs_tool_ms, "availability read"),
+    ]
+
+
+def sire_branch_meta(budgets: LatencyBudgets) -> list[BranchMeta]:
+    """SIRE workflow branches: resolve a person + a group concurrently (RRF), then page.
+
+    The multi-strategy RRF resolution fans out ~12 parallel Azure AI Search queries, so its
+    real latency is seconds, not the sub-second tool budget — give it a realistic budget so a
+    normal search shows green rather than a spurious "still working" breach.
+    """
+    return [
+        BranchMeta("resolve_person", "SIRE person resolution (RRF)", _SIRE_RESOLVE_BUDGET_MS, "person resolved"),
+        BranchMeta("resolve_group", "SIRE group resolution (RRF)", _SIRE_RESOLVE_BUDGET_MS, "group resolved"),
         BranchMeta("page", "handing page to Engage", budgets.comms_tool_ms, "paged", escalation=True),
     ]
 
 
 # A person/group lookup that the SIRE workflow should resolve + page (docs: SIRE is one agent
 # behind the front door). ``contact_provider`` always routes here; a general request that reads
-# like a directory lookup (find / who is / page / call / on-call) does too.
+# like a directory lookup (find / who is / page / call / on-call / prepare a team) does too.
 _SIRE_LOOKUP_RE = re.compile(
-    r"\b(find|who\s+is|who's|look\s*up|lookup|page|call|reach|contact|connect|on[-\s]?call)\b",
+    r"\b(find|who\s+is|who's|look\s*up|lookup|page|call|reach|contact|connect|on[-\s]?call|"
+    r"prep(?:are)?|notify|alert|get\s+me|nurse|nurses|team|charge|unit)\b",
     re.IGNORECASE,
 )
 
 
-def is_sire_query(intent: str, utterance: str) -> bool:
-    """True when the utterance should route to the SIRE resolve+page workflow."""
+def is_sire_query(
+    intent: str, utterance: str, entities: dict[str, str] | None = None
+) -> bool:
+    """True when the utterance should route to the SIRE resolve+page workflow.
+
+    ``contact_provider`` always routes here. A ``general_request`` routes here when the Voice
+    Live model already classified a person/group/role entity (the strongest directory-lookup
+    signal — e.g. "prepare one and two east nurses" tags a ``group``) OR the utterance reads
+    like a directory lookup (find / who is / page / prepare a team).
+    """
     if intent == "contact_provider":
         return True
-    if intent == "general_request" and _SIRE_LOOKUP_RE.search(utterance or ""):
-        return True
+    if intent == "general_request":
+        ents = entities or {}
+        if ents.get("group") or ents.get("person") or ents.get("role"):
+            return True
+        if _SIRE_LOOKUP_RE.search(utterance or ""):
+            return True
     return False
-
-
-# Role / team words — when the request names a role or team (not a person's name) the SIRE
-# agent should prefer a GROUP match (e.g. "trauma nurse" → the "OR Trauma Nurse" group), even
-# if a same-scored person exists. A bare personal name resolves to a person.
-_ROLE_TEAM_RE = re.compile(
-    r"\b(nurse|charge|on[-\s]?call|team|pharmacist|therapist|respiratory|tech|technician|aide|"
-    r"rrt|rapid\s+response|unit|department|dept|ward|floor|station|group|service|"
-    r"icu|picu|nicu|ccu|pacu|\ber\b|\bed\b|\bor\b|trauma|code|resident|attending|hospitalist|"
-    r"intensivist|surgeon|anesthes|cardiolog|neurolog|radiolog)\b",
-    re.IGNORECASE,
-)
 
 
 def workflow_key(intent: str, path: str) -> str:
     """Map (intent, path) to a workflow key for the flow visualizer."""
     if path == "fast":
         return "sepsis" if intent in SEPSIS_INTENTS else "emergency"
+    if intent == "protocol_lookup":
+        return "knowledge"
+    if intent == "check_blood_supply":
+        return "supply"
     if is_sire_query(intent, "") or intent == "contact_provider":
         return "sire"
     return "standard"
@@ -275,6 +305,32 @@ class SireView:
     paged_to: str = ""
 
 
+@dataclass
+class KnowledgeView:
+    """Live protocol-lookup panel: the question, the spoken answer, and cited sources."""
+
+    active: bool = False
+    query: str = ""
+    answer: str = ""
+    citations: list[tuple[str, str, str]] = field(default_factory=list)  # (id, title, url)
+    grounded: bool = False
+
+
+@dataclass
+class SupplyView:
+    """Live blood-bank panel: the read-only LIS availability + crossmatch for the request."""
+
+    active: bool = False
+    query: str = ""
+    patient_ref: str | None = None
+    patient_blood_type: str | None = None
+    crossmatch_status: str | None = None
+    crossmatch_units_ready: int | None = None
+    units: list[tuple[str, int, str, str]] = field(default_factory=list)  # (product, n, type, loc)
+    mtp_available: bool | None = None
+    source_system: str = ""
+
+
 def is_spoken_line(text: str) -> bool:
     """Whether a streamed line is natural spoken narration (vs a cockpit-only telemetry cue).
 
@@ -311,6 +367,8 @@ class CockpitState:
             self.call_log: list[tuple[str, str, str, float | None]] = []
             self.sepsis: SepsisView = SepsisView()
             self.sire: SireView = SireView()
+            self.knowledge: KnowledgeView = KnowledgeView()
+            self.supply: SupplyView = SupplyView()
             self.summary: str = ""
             self.ack_latency_ms: float | None = None
             self._breaches: set[str] = set()
@@ -354,6 +412,47 @@ class CockpitState:
     def start_sire_panel(self, query: str) -> None:
         with self._lock:
             self.sire = SireView(active=True, query=query)
+
+    def start_knowledge_panel(self, query: str) -> None:
+        with self._lock:
+            self.knowledge = KnowledgeView(active=True, query=query)
+    def finalize_knowledge(
+        self,
+        *,
+        answer: str,
+        citations: list[tuple[str, str, str]],
+    ) -> None:
+        with self._lock:
+            self.knowledge.active = True
+            self.knowledge.answer = answer
+            self.knowledge.citations = list(citations)
+            self.knowledge.grounded = bool(citations)
+
+    def start_supply_panel(self, query: str) -> None:
+        with self._lock:
+            self.supply = SupplyView(active=True, query=query)
+
+    def finalize_supply(
+        self,
+        *,
+        patient_ref: str | None,
+        patient_blood_type: str | None,
+        crossmatch_status: str | None,
+        crossmatch_units_ready: int | None,
+        units: list[tuple[str, int, str, str]],
+        mtp_available: bool | None,
+        source_system: str,
+    ) -> None:
+        with self._lock:
+            s = self.supply
+            s.active = True
+            s.patient_ref = patient_ref
+            s.patient_blood_type = patient_blood_type
+            s.crossmatch_status = crossmatch_status
+            s.crossmatch_units_ready = crossmatch_units_ready
+            s.units = list(units)
+            s.mtp_available = mtp_available
+            s.source_system = source_system
 
     def finalize_sire(
         self,
@@ -494,6 +593,8 @@ class CockpitState:
                 call_log=list(self.call_log),
                 sepsis=replace(self.sepsis),
                 sire=replace(self.sire),
+                knowledge=replace(self.knowledge),
+                supply=replace(self.supply),
                 summary=self.summary,
                 ack_latency_ms=self.ack_latency_ms,
             )
@@ -517,6 +618,8 @@ class CockpitSnapshot:
     call_log: list[tuple[str, str, str, float | None]]
     sepsis: SepsisView
     sire: SireView
+    knowledge: KnowledgeView
+    supply: SupplyView
     summary: str
     ack_latency_ms: float | None
 
@@ -592,7 +695,11 @@ async def _drive(
             await _run_sepsis(state, gateway, envelope, tools, budgets, window_s)
         elif is_emergency:
             await _run_emergency(state, gateway, envelope, tools, budgets)
-        elif is_sire_query(envelope.intent, envelope.utterance):
+        elif envelope.intent == "protocol_lookup":
+            await _run_knowledge(state, gateway, envelope, tools, budgets)
+        elif envelope.intent == "check_blood_supply":
+            await _run_supply(state, gateway, envelope, tools, budgets)
+        elif is_sire_query(envelope.intent, envelope.utterance, envelope.entities):
             await _run_sire(state, gateway, envelope, tools, budgets)
         else:
             await _run_standard(state, gateway, envelope, tools, budgets)
@@ -648,6 +755,140 @@ async def _run_emergency(
     state.finish(result.summary or "", result.ack_latency_ms)
 
 
+async def _run_knowledge(
+    state: CockpitState,
+    gateway: VoiceGatewayBase,
+    envelope: IntentEnvelope,
+    tools: ToolsConfig,
+    budgets: LatencyBudgets,
+) -> None:
+    """Protocol lookup: retrieve the cited protocol from the knowledge base and read it back.
+
+    Grounds the answer in the same protocol corpus behind the sepsis KB (Foundry IQ), quotes the
+    source, and speaks it to the nurse. Read-only decision support — it never orders or acts.
+    """
+    import time as _t  # noqa: PLC0415
+
+    from src.knowledge.protocol_documents import retrieve_local  # noqa: PLC0415
+
+    state.set_path("standard")
+    state.set_workflow("knowledge")
+    state.set_branches(knowledge_branch_meta(budgets))
+    cid = envelope.correlation_id
+    query = (envelope.entities.get("topic") or envelope.utterance or "").strip() or "the protocol"
+    state.start_knowledge_panel(query)
+    await gateway.speak("Let me pull that from the clinical protocol library.")
+
+    state._mark_running("retrieve")  # noqa: SLF001 - internal, same module
+    t0 = _t.perf_counter()
+    try:
+        docs = retrieve_local(query, top=2)
+    except Exception as exc:  # degrade, still narrate
+        logger.warning("protocol lookup failed correlation_id=%s error=%s", cid, exc)
+        docs = []
+    latency = round((_t.perf_counter() - t0) * 1000, 1)
+
+    if docs:
+        top = docs[0]
+        citations = [(d.source.source_id, d.title, d.source.url) for d in docs]
+        answer = top.content
+        summary = f"{answer} That's from {top.source.title}."
+    else:
+        citations = []
+        answer = ""
+        summary = (
+            f"I couldn't find a protocol matching {query} in the knowledge base. "
+            "Please rephrase or name the guideline."
+        )
+
+    state.finalize_branches({"retrieve": latency}, {})
+    state.finalize_knowledge(answer=answer, citations=citations)
+    await gateway.speak(summary)
+    state.finish(summary, None)
+
+
+# Human-readable blood-product names for the spoken read-back.
+_PRODUCT_NAMES: dict[str, str] = {
+    "prbc": "red cells",
+    "ffp": "plasma",
+    "platelets": "platelets",
+    "cryo": "cryoprecipitate",
+    "whole_blood": "whole blood",
+}
+
+
+async def _run_supply(
+    state: CockpitState,
+    gateway: VoiceGatewayBase,
+    envelope: IntentEnvelope,
+    tools: ToolsConfig,
+    budgets: LatencyBudgets,
+) -> None:
+    """Blood-supply lookup: read availability + crossmatch from the LIS and read it back.
+
+    Read-only decision support via the ``blood_bank`` tool — reports units, blood type, and
+    crossmatch status verbatim from the LIS. It never orders, reserves, or releases blood.
+    """
+    import time as _t  # noqa: PLC0415
+
+    from src.tools.blood_bank import check_blood_bank  # noqa: PLC0415
+
+    state.set_path("standard")
+    state.set_workflow("supply")
+    state.set_branches(supply_branch_meta(budgets))
+    cid = envelope.correlation_id
+    patient_ref = (envelope.entities.get("patient_ref") or "").strip()
+    query = patient_ref or "the blood bank"
+    state.start_supply_panel(query)
+    await gateway.speak("Checking the blood bank.")
+
+    state._mark_running("blood_bank")  # noqa: SLF001 - internal, same module
+    t0 = _t.perf_counter()
+    try:
+        result = await check_blood_bank(patient_ref or "general", correlation_id=cid, config=tools)
+    except Exception as exc:  # degrade, still narrate
+        logger.warning("blood supply lookup failed correlation_id=%s error=%s", cid, exc)
+        result = None
+    latency = round((_t.perf_counter() - t0) * 1000, 1)
+
+    if result is not None and result.resolved and not result.error:
+        units = [(u.product, u.units_available, u.blood_type, u.location) for u in result.units]
+        # Spoken read-back: lead with red cells by blood type (what a nurse asks for).
+        prbc = [u for u in result.units if u.product == "prbc"]
+        parts = [f"{u.units_available} units of {u.blood_type}" for u in prbc] or [
+            f"{u.units_available} units of {_PRODUCT_NAMES.get(u.product, u.product)}"
+            for u in result.units
+        ]
+        avail = ", ".join(parts)
+        if patient_ref and result.crossmatch_status and result.crossmatch_status != "none":
+            xm = result.crossmatch_status.replace("_", " ")
+            summary = (
+                f"For {patient_ref}, blood type {result.patient_blood_type}, crossmatch is {xm} "
+                f"with {result.crossmatch_units_ready} units ready. In inventory: {avail}."
+            )
+        else:
+            summary = f"The blood bank has {avail} available."
+        if result.massive_transfusion_protocol_available:
+            summary += " Massive transfusion protocol is available."
+        state.finalize_supply(
+            patient_ref=result.patient_ref, patient_blood_type=result.patient_blood_type,
+            crossmatch_status=result.crossmatch_status,
+            crossmatch_units_ready=result.crossmatch_units_ready,
+            units=units, mtp_available=result.massive_transfusion_protocol_available,
+            source_system=result.source_system,
+        )
+    else:
+        summary = "I couldn't read the blood bank just now. Please retry or call the blood bank directly."
+        state.finalize_supply(
+            patient_ref=patient_ref or None, patient_blood_type=None, crossmatch_status=None,
+            crossmatch_units_ready=None, units=[], mtp_available=None, source_system="",
+        )
+
+    state.finalize_branches({"blood_bank": latency}, {})
+    await gateway.speak(summary)
+    state.finish(summary, None)
+
+
 async def _run_sire(
     state: CockpitState,
     gateway: VoiceGatewayBase,
@@ -671,14 +912,12 @@ async def _run_sire(
     state.set_workflow("sire")
     state.set_branches(sire_branch_meta(budgets))
     cid = envelope.correlation_id
-    # The cleaned utterance preserves qualifiers ("PICU", "trauma", "on-call") that the coarse
-    # role-entity extraction drops, so it resolves the specific team/person better.
-    query = (
-        _clean_sire_query(envelope.utterance)
-        or envelope.entities.get("role")
-        or envelope.entities.get("name")
-        or "the requested contact"
-    )
+    # The Voice Live model already classified the entity as a person or a group in the
+    # envelope (route_intent's `person`/`group` slots). Trust it — this is exactly how the
+    # standalone SIRE agent (main.py) routes: the SAME realtime model that does STT picks
+    # search_user vs search_group via function calling. That's why there is no verb/role
+    # regex here; the model, not a heuristic, decides which index to page.
+    kind, query = _sire_target(envelope)
     state.start_sire_panel(query)
     await gateway.speak(f"Looking up {query} in the directory.")
 
@@ -707,7 +946,7 @@ async def _run_sire(
         latencies.setdefault("resolve_person", 0.0)
         latencies.setdefault("resolve_group", 0.0)
 
-    match = _pick_sire_match(query, candidates)
+    match = _select_sire_match(kind, candidates)
     page_id: str | None = None
     paged_to = ""
     if match is not None:
@@ -780,38 +1019,53 @@ def _sire_candidates(people, groups) -> list[SireMatch]:
 # Command verbs / filler stripped from an utterance before the SIRE directory search, so the
 # query is the person/role ("trauma nurse") not the command ("page the trauma nurse" — which
 # would spuriously match a person literally named "Page").
-_SIRE_STRIP_RE = re.compile(
-    r"\b(page|contact|reach|connect|find|locate|look\s*up|lookup|get|dial|"
-    r"who\s+is|who's|for\s+me|please|can\s+you|could\s+you|i\s+need|need\s+to|"
-    r"the|a|an|to|my)\b"
-    r"|(?<!on[-\s])\bcall\b",  # strip the verb "call" but keep "on-call" / "on call"
-    re.IGNORECASE,
-)
+def _tidy_query(text: str) -> str:
+    """Normalize whitespace and drop punctuation from a fallback utterance query.
+
+    Only applied to the text-stub / test fallback path (a raw utterance like "PICU SWAT?"),
+    never to the model's entity slots — those already arrive clean. Keeps letters, digits,
+    spaces, and hyphens so a transcribed trailing "?" can't break the directory search.
+    """
+    cleaned = re.sub(r"[^\w\s-]", " ", text or "")
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _clean_sire_query(text: str) -> str:
-    """Strip command verbs + filler so the directory search sees the person/role only."""
-    cleaned = _SIRE_STRIP_RE.sub(" ", text or "")
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned or (text or "").strip()
+def _sire_target(envelope: IntentEnvelope) -> tuple[str | None, str]:
+    """Return ``(kind, query)`` for the SIRE search from the model's entity classification.
+
+    Trusts the Voice Live model's ``group`` / ``person`` slots (route_intent) the same way the
+    standalone SIRE agent trusts its function-calling routing: the model decides person vs group.
+    Falls back to ``role`` / ``name`` / the raw utterance on the text-stub and test paths (where
+    those model slots are absent), leaving ``kind`` unset so the page target is chosen by match
+    confidence instead of a heuristic.
+    """
+    ents = envelope.entities or {}
+    group = (ents.get("group") or "").strip()
+    if group:
+        return "group", group
+    person = (ents.get("person") or ents.get("name") or "").strip()
+    if person:
+        return "person", person
+    fallback = (ents.get("role") or "").strip() or (envelope.utterance or "").strip()
+    return None, _tidy_query(fallback) or "the requested contact"
 
 
-def _pick_sire_match(query: str, candidates: list[SireMatch]) -> SireMatch | None:
-    """Choose which candidate to page: a GROUP for role/team requests, else the top score.
+def _select_sire_match(kind: str | None, candidates: list[SireMatch]) -> SireMatch | None:
+    """Choose which candidate to page.
 
-    Person and group scores are on separate scales, so a same-scored person would otherwise
-    always win the tie. Prefer the top group only when the request is role/team-like AND that
-    group is a *confident* RRF match (a clear winner over #2) — e.g. "trauma nurse" resolves to
-    the confident "OR Trauma Nurse" team, while "nurse Barbara" (no confident group) resolves to
-    the person Barbara. A bare personal name has no group and resolves to a person.
+    When the model classified the entity (``kind`` set), page that index's top result — mirroring
+    main.py, where the model picks the tool and never compares person vs group scores (they sit on
+    independent 0-100 scales). When ``kind`` is unset (fallback path), the most confident result
+    wins, else the top score.
     """
     if not candidates:
         return None
-    groups = [c for c in candidates if c.kind == "group"]
-    role_like = bool(_ROLE_TEAM_RE.search(query or ""))
-    if role_like and groups and groups[0].confident:
-        return groups[0]
-    return candidates[0]  # highest score overall (person wins exact ties for names)
+    if kind in ("person", "group"):
+        same = [c for c in candidates if c.kind == kind]
+        if same:
+            return same[0]
+    confident = [c for c in candidates if c.confident]
+    return (confident or candidates)[0]
 
 
 async def _run_standard(
@@ -858,7 +1112,9 @@ _WORKFLOW_ROUTES: tuple[tuple[str, str], ...] = (
     ("sepsis", "EMERGENCY · sepsis"),
     ("emergency", "EMERGENCY · code / RRT / stroke / fall"),
     ("sire", "ROUTINE · page / contact a provider"),
-    ("standard", "ROUTINE · locate / blood / general"),
+    ("knowledge", "ROUTINE · protocol / guideline lookup"),
+    ("supply", "ROUTINE · blood / supply lookup"),
+    ("standard", "ROUTINE · locate / general"),
 )
 
 

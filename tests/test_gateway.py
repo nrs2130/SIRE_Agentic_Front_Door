@@ -127,3 +127,26 @@ def test_route_intent_tool_schema() -> None:
     assert ROUTE_INTENT_TOOL["name"] == "route_intent"
     assert props["urgency"]["enum"] == ["EMERGENCY", "ROUTINE"]
     assert set(ROUTE_INTENT_TOOL["parameters"]["required"]) == {"intent", "urgency"}
+
+
+def test_voicelive_dedupes_repeated_route_intent() -> None:
+    """The realtime model re-calls route_intent per utterance; only the first emits.
+
+    Guards the live-voice loop bug: repeated calls for the same spoken utterance would
+    each reset the cockpit and launch an overlapping workflow run. A new transcription
+    (``_last_emitted_utterance = None``) re-opens emission for the next turn.
+    """
+    from src.gateway.gateway import VoiceLiveGateway
+
+    gw = VoiceLiveGateway.__new__(VoiceLiveGateway)  # no SDK/session needed for this unit
+    gw._last_emitted_utterance = None
+
+    assert gw._register_emit("Call Dr. Alexa Novak") is True   # first call → emit
+    assert gw._register_emit("Call Dr. Alexa Novak") is False  # repeat → suppressed
+    assert gw._register_emit("Call Dr. Alexa Novak") is False  # repeat → suppressed
+    gw._last_emitted_utterance = None                          # new transcription (next turn)
+    assert gw._register_emit("Call Dr. Alexa Novak") is True   # same phrase, new turn → emit
+    # An empty utterance is never deduped (can't tell repeats apart).
+    assert gw._register_emit("") is True
+    assert gw._register_emit("") is True
+
